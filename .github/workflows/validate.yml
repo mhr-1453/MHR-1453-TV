@@ -35,6 +35,7 @@ jobs:
           import subprocess
           import json
           import os
+          import time
 
           file = Path("mhr-1453-tv.m3u")
 
@@ -84,108 +85,124 @@ jobs:
 
           def check_channel(channel):
               name, url = channel
+              last_error = "Bilinmeyen hata"
 
-              probe_command = [
-                  "ffprobe",
-                  "-v", "error",
-                  "-rw_timeout", "8000000",
-                  "-user_agent", USER_AGENT,
-                  "-show_entries", "stream=codec_type,codec_name",
-                  "-of", "json",
-                  "-i", url
-              ]
+              for attempt in range(2):
+                  try:
+                      probe_command = [
+                          "ffprobe",
+                          "-v", "error",
+                          "-rw_timeout", "15000000",
+                          "-user_agent", USER_AGENT,
+                          "-show_entries",
+                          "stream=codec_type,codec_name",
+                          "-of", "json",
+                          "-i", url
+                      ]
 
-              try:
-                  probe = subprocess.run(
-                      probe_command,
-                      capture_output=True,
-                      text=True,
-                      timeout=12
-                  )
-
-                  if probe.returncode != 0:
-                      error = probe.stderr.lower()
-
-                      if "403" in error:
-                          return name, "BLOCKED", "HTTP 403 - Erişim engelli"
-
-                      if "401" in error:
-                          return name, "WARN", "HTTP 401 - Yetkilendirme gerekli"
-
-                      return name, "FAIL", "FFprobe: " + probe.stderr[-180:]
-
-                  data = json.loads(probe.stdout)
-                  streams = data.get("streams", [])
-
-                  video = any(
-                      s.get("codec_type") == "video"
-                      for s in streams
-                  )
-
-                  audio = any(
-                      s.get("codec_type") == "audio"
-                      for s in streams
-                  )
-
-                  if not video and not audio:
-                      return name, "FAIL", "Ses veya video akışı bulunamadı"
-
-                  decode_command = [
-                      "ffmpeg",
-                      "-nostdin",
-                      "-hide_banner",
-                      "-loglevel", "error",
-                      "-rw_timeout", "8000000",
-                      "-user_agent", USER_AGENT,
-                      "-i", url,
-                      "-t", "5",
-                      "-map", "0:v:0?",
-                      "-map", "0:a:0?",
-                      "-f", "null",
-                      "-"
-                  ]
-
-                  decode = subprocess.run(
-                      decode_command,
-                      capture_output=True,
-                      text=True,
-                      timeout=15
-                  )
-
-                  if decode.returncode != 0:
-                      error = decode.stderr.lower()
-
-                      if "403" in error:
-                          return name, "BLOCKED", "FFmpeg HTTP 403"
-
-                      return name, "FAIL", "Medya çözümlenemedi: " + decode.stderr[-180:]
-
-                  video_text = "Var" if video else "Yok"
-                  audio_text = "Var" if audio else "Yok"
-
-                  codecs = ", ".join(
-                      s.get("codec_name", "?")
-                      for s in streams
-                  )
-
-                  if video and audio:
-                      return (
-                          name,
-                          "OK",
-                          f"Video: {video_text} | Ses: {audio_text} | Codec: {codecs}"
+                      probe = subprocess.run(
+                          probe_command,
+                          capture_output=True,
+                          text=True,
+                          timeout=20
                       )
 
-                  return (
-                      name,
-                      "PARTIAL",
-                      f"Video: {video_text} | Ses: {audio_text} | Codec: {codecs}"
-                  )
+                      if probe.returncode != 0:
+                          error = probe.stderr.lower()
 
-              except subprocess.TimeoutExpired:
-                  return name, "TIMEOUT", "Kontrol zaman aşımına uğradı"
+                          if "403" in error:
+                              return name, "BLOCKED", "HTTP 403 - Erişim engelli"
 
-              except Exception as error:
-                  return name, "FAIL", str(error)[:180]
+                          if "401" in error:
+                              return name, "WARN", "HTTP 401 - Yetkilendirme gerekli"
+
+                          last_error = probe.stderr[-180:]
+
+                      else:
+                          data = json.loads(probe.stdout)
+                          streams = data.get("streams", [])
+
+                          video = any(
+                              s.get("codec_type") == "video"
+                              for s in streams
+                          )
+
+                          audio = any(
+                              s.get("codec_type") == "audio"
+                              for s in streams
+                          )
+
+                          if video or audio:
+                              decode_command = [
+                                  "ffmpeg",
+                                  "-nostdin",
+                                  "-hide_banner",
+                                  "-loglevel", "error",
+                                  "-rw_timeout", "15000000",
+                                  "-user_agent", USER_AGENT,
+                                  "-i", url,
+                                  "-t", "10",
+                                  "-map", "0:v:0?",
+                                  "-map", "0:a:0?",
+                                  "-f", "null",
+                                  "-"
+                              ]
+
+                              decode = subprocess.run(
+                                  decode_command,
+                                  capture_output=True,
+                                  text=True,
+                                  timeout=25
+                              )
+
+                              if decode.returncode == 0:
+                                  codecs = ", ".join(
+                                      s.get("codec_name", "?")
+                                      for s in streams
+                                  )
+
+                                  if video and audio:
+                                      return (
+                                          name,
+                                          "OK",
+                                          f"Video: Var | Ses: Var | "
+                                          f"10 saniye test edildi | {codecs}"
+                                      )
+
+                                  last_error = (
+                                      f"Video: {'Var' if video else 'Yok'} | "
+                                      f"Ses: {'Var' if audio else 'Yok'}"
+                                  )
+
+                              else:
+                                  error = decode.stderr.lower()
+
+                                  if "403" in error:
+                                      return name, "BLOCKED", "FFmpeg HTTP 403"
+
+                                  last_error = decode.stderr[-180:]
+
+                          else:
+                              last_error = "Video ve ses akışı bulunamadı"
+
+                  except subprocess.TimeoutExpired:
+                      last_error = "Medya testi zaman aşımına uğradı"
+
+                  except Exception as error:
+                      last_error = str(error)[:180]
+
+                  if attempt == 0:
+                      print(
+                          f"{name}: Akış doğrulanamadı, "
+                          "2 saniye sonra tekrar deneniyor..."
+                      )
+                      time.sleep(2)
+
+              return (
+                  name,
+                  "FAIL",
+                  f"İkinci denemede de doğrulanamadı: {last_error}"
+              )
 
           print(f"Toplam {len(channels)} kanal kontrol edilecek.")
 
@@ -204,9 +221,7 @@ jobs:
 
           results.sort(key=lambda x: x[0].casefold())
 
-          states = [
-              "OK", "PARTIAL", "BLOCKED", "FAIL", "TIMEOUT"
-          ]
+          states = ["OK", "WARN", "BLOCKED", "FAIL"]
 
           counts = {
               state: sum(1 for x in results if x[1] == state)
@@ -215,10 +230,9 @@ jobs:
 
           labels = {
               "OK": "✅ Görüntü + Ses",
-              "PARTIAL": "⚠️ Kısmi",
+              "WARN": "⚠️ Uyarı",
               "BLOCKED": "🚫 Engellendi",
-              "FAIL": "❌ Hata",
-              "TIMEOUT": "⏱️ Zaman aşımı"
+              "FAIL": "❌ Hata"
           }
 
           summary = [
@@ -226,10 +240,9 @@ jobs:
               "",
               f"- Toplam kanal: **{len(channels)}**",
               f"- Görüntü + ses: **{counts['OK']}**",
-              f"- Kısmi akış: **{counts['PARTIAL']}**",
+              f"- Uyarı: **{counts['WARN']}**",
               f"- Engellenmiş: **{counts['BLOCKED']}**",
               f"- Hatalı: **{counts['FAIL']}**",
-              f"- Zaman aşımı: **{counts['TIMEOUT']}**",
               "",
               "| Kanal | Durum | Detay |",
               "|---|---|---|"
@@ -237,14 +250,16 @@ jobs:
 
           for name, state, detail in results:
               summary.append(
-                  f"| {name.replace('|', '/')} | {labels[state]} | "
+                  f"| {name.replace('|', '/')} | "
+                  f"{labels[state]} | "
                   f"{detail.replace('|', '/').replace(chr(10), ' ')} |"
               )
 
           summary.extend([
               "",
-              "> FFprobe akışları tespit eder, FFmpeg ilk 5 saniyeyi "
-              "çözümlemeyi dener. Bu test sürekli oynatma garantisi vermez."
+              "> FFprobe akışları tespit eder. FFmpeg 10 saniyelik "
+              "medya bölümünü çözümlemeyi dener. Başarılı sonuç "
+              "sürekli oynatma garantisi vermez."
           ])
 
           with open(
