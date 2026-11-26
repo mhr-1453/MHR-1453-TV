@@ -8,23 +8,28 @@ on:
   push:
     paths:
       - "mhr-1453-tv.m3u"
+      - ".github/workflows/validate.yml"
 
 permissions:
   contents: read
 
 jobs:
   validate:
-    name: Liste Kontrolü
+    name: M3U ve Yayın Kontrolü
     runs-on: ubuntu-latest
 
     steps:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: M3U dosyasını kontrol et
+      - name: Yayınları kontrol et
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          import os
 
           file = Path("mhr-1453-tv.m3u")
 
@@ -40,25 +45,124 @@ jobs:
           if not lines or lines[0] != "#EXTM3U":
               raise SystemExit("Geçersiz M3U başlığı!")
 
-          entries = 0
-          pending = False
+          channels = []
+          pending = None
 
           for line in lines[1:]:
               if line.startswith("#EXTINF:"):
-                  if pending:
+                  if pending is not None:
                       raise SystemExit("Eksik yayın adresi!")
-                  pending = True
+                  pending = line.rsplit(",", 1)[-1].strip() or "İsimsiz kanal"
 
               elif not line.startswith("#"):
-                  if not pending:
+                  if pending is None:
                       raise SystemExit("Bağımsız yayın adresi bulundu!")
+
                   if not line.startswith(("http://", "https://")):
-                      raise SystemExit("Geçersiz yayın adresi!")
-                  entries += 1
-                  pending = False
+                      raise SystemExit(f"Geçersiz adres: {pending}")
 
-          if pending:
-              raise SystemExit("Son kanalın yayın adresi eksik!")
+                  channels.append((pending, line))
+                  pending = None
 
-          print(f"Kontrol başarılı! {entries} kanal bulundu.")
+          if pending is not None:
+              raise SystemExit("Son kanalın adresi eksik!")
+
+          if not channels:
+              raise SystemExit("Hiç kanal bulunamadı!")
+
+          print(f"M3U geçerli: {len(channels)} kanal bulundu.")
+
+          def check_channel(channel):
+              name, url = channel
+
+              request = Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0",
+                      "Range": "bytes=0-4095"
+                  }
+              )
+
+              try:
+                  with urlopen(request, timeout=15) as response:
+                      status = response.status
+                      sample = response.read(4096)
+
+                  if 200 <= status < 300:
+                      if b"#EXTM3U" in sample:
+                          return name, "OK", f"HTTP {status} - HLS geçerli"
+
+                      return name, "WARN", f"HTTP {status} - HLS doğrulanamadı"
+
+                  return name, "FAIL", f"HTTP {status}"
+
+              except HTTPError as error:
+                  if error.code in (401, 403, 429):
+                      return name, "WARN", f"HTTP {error.code} - Erişim kısıtlı"
+
+                  return name, "FAIL", f"HTTP {error.code}"
+
+              except (URLError, TimeoutError, OSError) as error:
+                  return name, "FAIL", f"Bağlantı hatası: {error}"
+
+          results = []
+
+          with ThreadPoolExecutor(max_workers=5) as executor:
+              futures = [
+                  executor.submit(check_channel, channel)
+                  for channel in channels
+              ]
+
+              for future in as_completed(futures):
+                  results.append(future.result())
+
+          results.sort(key=lambda x: x[0].casefold())
+
+          ok = [x for x in results if x[1] == "OK"]
+          warn = [x for x in results if x[1] == "WARN"]
+          failed = [x for x in results if x[1] == "FAIL"]
+
+          print("\n===== MHR-1453 TV SONUÇLARI =====")
+
+          summary = [
+              "## MHR-1453 TV Yayın Kontrolü",
+              "",
+              f"- Toplam kanal: **{len(channels)}**",
+              f"- Çalışır görünen: **{len(ok)}**",
+              f"- Uyarı: **{len(warn)}**",
+              f"- Erişilemeyen: **{len(failed)}**",
+              "",
+              "| Kanal | Durum | Açıklama |",
+              "|---|---|---|"
+          ]
+
+          for name, state, detail in results:
+              label = {
+                  "OK": "✅ OK",
+                  "WARN": "⚠️ Uyarı",
+                  "FAIL": "❌ Hata"
+              }[state]
+
+              print(f"{label} - {name}: {detail}")
+
+              summary.append(
+                  f"| {name.replace('|', '/')} | {label} | {detail} |"
+              )
+
+          summary.append("")
+          summary.append(
+              "> Bu test bağlantıyı ve HLS yanıtını kontrol eder. "
+              "Görüntü ve sesin oynatılacağını kesin olarak garanti etmez. "
+              "401, 403 ve 429 yanıtları uyarı olarak değerlendirilir."
+          )
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+
+          if failed:
+              raise SystemExit(
+                  f"{len(failed)} kanal erişilemedi!"
+              )
+
+          print("\nKontrol tamamlandı!")
           PY
