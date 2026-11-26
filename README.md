@@ -7,7 +7,9 @@
 
 ### 📺 Oynatma Listesi
 
-[⬇️ M3U Listesini Aç](https://raw.githubusercontent.com/mhr-1453/MHR-1453-TV/main/mhr-1453-tv.m3u)
+```text
+https://raw.githubusercontent.com/mhr-1453/MHR-1453-TV/main/mhr-1453-tv.m3u
+```
 
 ### 📜 Lisans
 
