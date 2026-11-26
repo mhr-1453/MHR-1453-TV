@@ -22,7 +22,7 @@ jobs:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: Python ile yayınları kontrol et
+      - name: Yayınları kontrol et
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -80,57 +80,93 @@ jobs:
               "VLC/3.0.21 LibVLC/3.0.21"
           ]
 
+          ACCEPT_HEADERS = [
+              "*/*",
+              "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+              "application/octet-stream, */*"
+          ]
+
           def check_channel(channel):
               name, url = channel
+
+              attempts = []
+
+              for ua in USER_AGENTS:
+                  for accept in ACCEPT_HEADERS:
+                      attempts.append({
+                          "User-Agent": ua,
+                          "Accept": accept,
+                          "Connection": "keep-alive"
+                      })
+
+                      attempts.append({
+                          "User-Agent": ua,
+                          "Accept": accept,
+                          "Connection": "keep-alive",
+                          "Range": "bytes=0-4095"
+                      })
+
               last_error = "Bilinmeyen hata"
+              saw_403 = False
+              saw_429 = False
+              saw_503 = False
 
-              for attempt in range(2):
-                  for user_agent in USER_AGENTS:
-                      request = Request(
-                          url,
-                          headers={
-                              "User-Agent": user_agent,
-                              "Accept": "*/*",
-                              "Range": "bytes=0-4095"
-                          }
-                      )
+              for index, headers in enumerate(attempts):
+                  request = Request(
+                      url,
+                      headers=headers,
+                      method="GET"
+                  )
 
-                      try:
-                          with urlopen(request, timeout=15) as response:
-                              status = response.status
-                              sample = response.read(4096)
+                  try:
+                      with urlopen(request, timeout=15) as response:
+                          status = response.status
+                          sample = response.read(4096)
 
-                          if status in (200, 206):
-                              if b"#EXTM3U" in sample:
-                                  return name, "OK", f"HTTP {status} - HLS geçerli"
+                      if status in (200, 206):
+                          if b"#EXTM3U" in sample:
+                              return name, "OK", f"HTTP {status} - HLS geçerli"
 
-                              return name, "WARN", f"HTTP {status} - İçerik alındı, HLS doğrulanamadı"
+                          return name, "WARN", f"HTTP {status} - İçerik alındı, HLS doğrulanamadı"
 
-                          return name, "WARN", f"HTTP {status}"
+                      return name, "WARN", f"HTTP {status}"
 
-                      except HTTPError as error:
-                          last_error = f"HTTP {error.code}"
+                  except HTTPError as error:
+                      last_error = f"HTTP {error.code}"
 
-                          if error.code == 403:
-                              continue
+                      if error.code == 403:
+                          saw_403 = True
+                          continue
 
-                          if error.code == 429:
-                              return name, "WARN", "HTTP 429 - İstek sınırı"
+                      if error.code == 429:
+                          saw_429 = True
+                          if index < len(attempts) - 1:
+                              sleep(3)
+                          continue
 
-                          if error.code == 401:
-                              return name, "WARN", "HTTP 401 - Yetkilendirme gerekli"
+                      if error.code == 503:
+                          saw_503 = True
+                          if index < len(attempts) - 1:
+                              sleep(3)
+                          continue
 
-                          return name, "FAIL", last_error
+                      if error.code == 401:
+                          return name, "WARN", "HTTP 401 - Yetkilendirme gerekli"
 
-                      except (URLError, TimeoutError, OSError) as error:
-                          last_error = str(error)
-                          break
+                      return name, "FAIL", last_error
 
-                  if attempt == 0:
-                      sleep(2)
+                  except (URLError, TimeoutError, OSError) as error:
+                      last_error = str(error)
+                      continue
 
-              if "403" in last_error:
-                  return name, "BLOCKED", "Tüm User-Agent denemelerinde HTTP 403"
+              if saw_403:
+                  return name, "BLOCKED", "Alternatif isteklerde de HTTP 403"
+
+              if saw_429:
+                  return name, "WARN", "HTTP 429 - İstek sınırı"
+
+              if saw_503:
+                  return name, "WARN", "HTTP 503 - Sunucu geçici olarak kullanılamıyor"
 
               return name, "FAIL", last_error
 
@@ -152,6 +188,13 @@ jobs:
           failed = [x for x in results if x[1] == "FAIL"]
           blocked = [x for x in results if x[1] == "BLOCKED"]
 
+          labels = {
+              "OK": "✅ OK",
+              "WARN": "⚠️ Uyarı",
+              "FAIL": "❌ Hata",
+              "BLOCKED": "🚫 Engellendi"
+          }
+
           print("\n===== MHR-1453 TV SONUÇLARI =====")
 
           summary = [
@@ -167,13 +210,6 @@ jobs:
               "|---|---|---|"
           ]
 
-          labels = {
-              "OK": "✅ OK",
-              "WARN": "⚠️ Uyarı",
-              "FAIL": "❌ Hata",
-              "BLOCKED": "🚫 Engellendi"
-          }
-
           for name, state, detail in results:
               label = labels[state]
 
@@ -188,9 +224,8 @@ jobs:
 
           summary.extend([
               "",
-              "> User-Agent denemeleri erişim doğrulaması içindir. "
-              "HTTP 403 erişim engelini, HTTP 206 ise kısmi yanıtı ifade eder. "
-              "Bu kontrol görüntü ve ses oynatımını garanti etmez."
+              "> Bu kontrol HTTP erişimini ve HLS yanıtını doğrular. "
+              "Görüntü ve sesin oynatılacağını garanti etmez."
           ])
 
           with open(
