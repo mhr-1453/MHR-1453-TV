@@ -1,0 +1,64 @@
+
+name: M3U Otomatik Kontrol
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+  push:
+    paths:
+      - "mhr-1453-tv.m3u"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Liste Kontrolü
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Depoyu indir
+        uses: actions/checkout@v4
+
+      - name: M3U dosyasını kontrol et
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          file = Path("mhr-1453-tv.m3u")
+
+          if not file.exists():
+              raise SystemExit("M3U dosyası bulunamadı!")
+
+          lines = [
+              line.strip()
+              for line in file.read_text(encoding="utf-8-sig").splitlines()
+              if line.strip()
+          ]
+
+          if not lines or lines[0] != "#EXTM3U":
+              raise SystemExit("Geçersiz M3U başlığı!")
+
+          entries = 0
+          pending = False
+
+          for line in lines[1:]:
+              if line.startswith("#EXTINF:"):
+                  if pending:
+                      raise SystemExit("Eksik yayın adresi!")
+                  pending = True
+
+              elif not line.startswith("#"):
+                  if not pending:
+                      raise SystemExit("Bağımsız yayın adresi bulundu!")
+                  if not line.startswith(("http://", "https://")):
+                      raise SystemExit("Geçersiz yayın adresi!")
+                  entries += 1
+                  pending = False
+
+          if pending:
+              raise SystemExit("Son kanalın yayın adresi eksik!")
+
+          print(f"Kontrol başarılı! {entries} kanal bulundu.")
+          PY
