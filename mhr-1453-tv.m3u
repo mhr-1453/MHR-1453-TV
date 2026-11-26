@@ -1,0 +1,88 @@
+#EXTM3U
+
+#EXTINF:-1 tvg-id="trt1" tvg-logo="https://files.catbox.moe/epz75g.png" group-title="Ulusal",TRT 1
+https://tv-trt1.medya.trt.com.tr/master.m3u8
+
+#EXTINF:-1 tvg-id="kanal7" tvg-logo="https://files.catbox.moe/sk8a7w.png" group-title="Ulusal",Kanal 7
+https://kanal7-live.daioncdn.net/kanal7/kanal7.m3u8
+
+#EXTINF:-1 tvg-id="showtv" tvg-logo="https://files.catbox.moe/u8b40e.png" group-title="Ulusal",Show TV
+https://rmtftbjlne.turknet.ercdn.net/bpeytmnqyp/showtv/showtv.m3u8
+
+#EXTINF:-1 tvg-id="startv" tvg-logo="https://files.catbox.moe/25jb1y.png" group-title="Ulusal",Star TV
+https://dogus.daioncdn.net/startv/startv_720p.m3u8?&sid=8vdu5dx79x5x&app=a20ac41e-bdc3-4aa1-934d-26b484480ac9&ce=3
+
+#EXTINF:-1 tvg-id="atv" tvg-logo="https://files.catbox.moe/7wg3xw.png" group-title="Ulusal",ATV
+https://rnttwmjcin.turknet.ercdn.net/lcpmvefbyo/atv/atv_720p.m3u8
+
+#EXTINF:-1 tvg-id="kanald" tvg-logo="https://files.catbox.moe/ea5vxn.png" group-title="Ulusal",Kanal D
+https://live.duhnet.tv/S2/HLS_LIVE/kanalddainp/playlist.m3u8
+
+#EXTINF:-1 tvg-id="now" tvg-logo="https://files.catbox.moe/1qkee0.png" group-title="Ulusal",Now TV
+https://now.sunarproje.com.tr/now.m3u8
+
+#EXTINF:-1 tvg-id="tv8" tvg-logo="https://files.catbox.moe/n1jnqu.png" group-title="Ulusal",TV8
+https://tv8.daioncdn.net/tv8/tv8.m3u8?app=tv8_web
+
+#EXTINF:-1 tvg-id="tv8bucuk" tvg-logo="https://files.catbox.moe/fnzs4v.png" group-title="Ulusal",TV8.5
+https://tv8.daioncdn.net/tv8bucuk/tv8bucuk.m3u8?app=tv8bucuk_web&ce=3&ppid=ee1b3f41775e58db9a2819d5853efc22
+
+#EXTINF:-1 tvg-id="tv4" tvg-logo="https://files.catbox.moe/fyu4kd.png" group-title="Ulusal",TV4
+https://turkmedya-live.ercdn.net/tv4/tv4.m3u8
+
+#EXTINF:-1 tvg-id="beyaztv" tvg-logo="https://files.catbox.moe/s4w807.png" group-title="Ulusal",Beyaz TV
+https://beyaztv-live.daioncdn.net/beyaztv/beyaztv_720p.m3u8
+
+#EXTINF:-1 tvg-id="showmax" tvg-logo="https://files.catbox.moe/redgc6.png" group-title="Ulusal",Showmax
+http://rmtftbjlne.turknet.ercdn.net/bpeytmnqyp/showmax/showmax.m3u8
+
+#EXTINF:-1 tvg-id="trtbelgesel" tvg-logo="https://files.catbox.moe/ftz8jf.png" group-title="Belgesel",TRT Belgesel
+https://tv-trtbelgesel.medya.trt.com.tr/master_720.m3u8
+
+#EXTINF:-1 tvg-id="dmax" tvg-logo="https://files.catbox.moe/sa5bhn.png" group-title="Belgesel",DMAX
+https://dogus.daioncdn.net/dmax/dmax.m3u8?app=dmax_web
+
+#EXTINF:-1 tvg-id="tlc" tvg-logo="https://files.catbox.moe/kkupck.png" group-title="Yaşam",TLC
+https://dogus.daioncdn.net/tlc/tlc_720p.m3u8?sig=876201ff1569c18da4b66965b764faf2&sid=7u5ircm7us8f&app=1aca0aa1-06e3-41ff-a8e5-38d7df475469&ce=3
+
+#EXTINF:-1 tvg-id="ciftcitv" tvg-logo="https://files.catbox.moe/rmgqss.png" group-title="Yaşam",Çiftçi TV
+https://live.artidijitalmedya.com/artidijital_ciftcitv/ciftcitv/chunks.m3u8
+
+#EXTINF:-1 tvg-id="trtcocuk" tvg-logo="https://files.catbox.moe/zohi6l.png" group-title="Çocuk",TRT Çocuk
+https://tv-trtcocuk.medya.trt.com.tr/master.m3u8?app=clean
+
+#EXTINF:-1 tvg-id="trtdiyanetcocuk" tvg-logo="https://files.catbox.moe/09ll2m.png" group-title="Çocuk",TRT Diyanet Çocuk
+https://tv-trtdiyanetcocuk.medya.trt.com.tr/master.m3u8?app=clean
+
+#EXTINF:-1 tvg-id="minikago" tvg-logo="https://files.catbox.moe/2hjgjh.png" group-title="Çocuk",Minika Go
+https://rnttwmjcin.turknet.ercdn.net/lcpmvefbyo/minikago/minikago.m3u8
+
+#EXTINF:-1 tvg-id="minikacocuk" tvg-logo="https://files.catbox.moe/3m1sp4.png" group-title="Çocuk",Minika Çocuk
+https://rnttwmjcin.turknet.ercdn.net/lcpmvefbyo/minikago_cocuk/minikago_cocuk.m3u8
+
+#EXTINF:-1 tvg-id="trtspor" tvg-logo="https://files.catbox.moe/ql1g83.png" group-title="Spor",TRT Spor
+https://tv-trtspor1.medya.trt.com.tr/master.m3u8
+
+#EXTINF:-1 tvg-id="aspor" tvg-logo="https://files.catbox.moe/zr1jpo.png" group-title="Spor",A Spor
+https://rnttwmjcin.turknet.ercdn.net/lcpmvefbyo/aspor/aspor.m3u8
+
+#EXTINF:-1 tvg-id="ntv" tvg-logo="https://files.catbox.moe/utjqjx.png" group-title="Haber",NTV
+https://dogus.daioncdn.net/ntv/ntv_720p.m3u8?sig=12e805494df807d580a4aae395a17c64&token=NTNpSGo5RFc3anhWYjVWZXN4QndvZXkzdm9CZXJLek5meEJOajNMbldvZz0=&sid=7umf8gmx7sxg&app=7c4bb802-0c41-409e-8cd2-799984995694&ce=3
+
+#EXTINF:-1 tvg-id="trthaber" tvg-logo="https://files.catbox.moe/03vtkm.png" group-title="Haber",TRT Haber
+https://tv-trthaber.medya.trt.com.tr/master.m3u8
+
+#EXTINF:-1 tvg-id="tgrt" tvg-logo="https://files.catbox.moe/yp6pvc.png" group-title="Haber",TGRT Haber
+https://canli.tgrthaber.com/tgrt.m3u8
+
+#EXTINF:-1 tvg-id="ahaber" tvg-logo="https://files.catbox.moe/cfv7hl.png" group-title="Haber",A Haber
+https://trkvz-live.ercdn.net/ahaberhd/ahaberhd.m3u8
+
+#EXTINF:-1 tvg-id="halktv" tvg-logo="https://files.catbox.moe/fhtu78.png" group-title="Haber",Halk TV
+https://halktv-live.daioncdn.net/halktv/halktv.m3u8
+
+#EXTINF:-1 tvg-id="tv360" tvg-logo="https://files.catbox.moe/7j9xm8.png" group-title="Haber",TV360
+https://turkmedya-live.ercdn.net/tv360/tv360.m3u8
+
+#EXTINF:-1 tvg-id="ulketv" tvg-logo="https://files.catbox.moe/0u1dv9.png" group-title="Haber",Ülke TV
+https://livetv.radyotvonline.net/kanal7live/ulketv/chunklist.m3u8
