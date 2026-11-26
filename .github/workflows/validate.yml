@@ -15,31 +15,21 @@ permissions:
 
 jobs:
   validate:
-    name: Chromium Yayın Kontrolü
+    name: Hızlı M3U Kontrolü
     runs-on: ubuntu-latest
 
     steps:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: Python kurulumu
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Playwright kurulumu
-        run: |
-          pip install playwright
-          python -m playwright install --with-deps chromium
-
-      - name: Yayınları tarayıcıyla kontrol et
+      - name: Yayınları kontrol et
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          from playwright.sync_api import sync_playwright, TimeoutError
           from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
           import os
-          import time
 
           file = Path("mhr-1453-tv.m3u")
 
@@ -47,9 +37,9 @@ jobs:
               raise SystemExit("M3U dosyası bulunamadı!")
 
           lines = [
-              line.strip()
-              for line in file.read_text(encoding="utf-8-sig").splitlines()
-              if line.strip()
+              x.strip()
+              for x in file.read_text(encoding="utf-8-sig").splitlines()
+              if x.strip()
           ]
 
           if not lines or lines[0] != "#EXTM3U":
@@ -62,16 +52,13 @@ jobs:
               if line.startswith("#EXTINF:"):
                   if pending is not None:
                       raise SystemExit("Eksik yayın adresi!")
-
                   pending = line.rsplit(",", 1)[-1].strip() or "İsimsiz kanal"
 
               elif not line.startswith("#"):
                   if pending is None:
-                      raise SystemExit("Bağımsız yayın adresi bulundu!")
-
+                      raise SystemExit("Bağımsız yayın adresi!")
                   if not line.startswith(("http://", "https://")):
                       raise SystemExit(f"Geçersiz adres: {pending}")
-
                   channels.append((pending, line))
                   pending = None
 
@@ -81,113 +68,77 @@ jobs:
           if not channels:
               raise SystemExit("Hiç kanal bulunamadı!")
 
-          print(f"{len(channels)} kanal bulundu.")
+          USER_AGENTS = [
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36",
+              "VLC/3.0.21 LibVLC/3.0.21"
+          ]
 
           def check_channel(channel):
               name, url = channel
               last_error = "Bilinmeyen hata"
 
-              try:
-                  with sync_playwright() as p:
-                      browser = p.chromium.launch(
-                          headless=True,
-                          args=["--no-sandbox"]
-                      )
+              for ua in USER_AGENTS:
+                  request = Request(
+                      url,
+                      headers={
+                          "User-Agent": ua,
+                          "Accept": "*/*",
+                          "Range": "bytes=0-4095"
+                      }
+                  )
 
-                      context = browser.new_context(
-                          user_agent=(
-                              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/131.0.0.0 Safari/537.36"
-                          ),
-                          locale="tr-TR",
-                          ignore_https_errors=False
-                      )
-
-                      page = context.new_page()
-
-                      response = page.goto(
-                          url,
-                          wait_until="domcontentloaded",
-                          timeout=20000
-                      )
-
-                      page.wait_for_timeout(1500)
-
-                      if response is None:
-                          result = (
-                              name,
-                              "WARN",
-                              "Tarayıcı yanıt alamadı"
-                          )
-                      else:
+                  try:
+                      with urlopen(request, timeout=5) as response:
                           status = response.status
-                          body = response.body()[:8192]
+                          sample = response.read(4096)
 
-                          if status in (200, 206):
-                              if b"#EXTM3U" in body:
-                                  result = (
-                                      name,
-                                      "OK",
-                                      f"HTTP {status} - HLS geçerli"
-                                  )
-                              else:
-                                  result = (
-                                      name,
-                                      "WARN",
-                                      f"HTTP {status} - İçerik alındı, HLS doğrulanamadı"
-                                  )
+                      if status in (200, 206):
+                          if b"#EXTM3U" in sample:
+                              return name, "OK", f"HTTP {status} - HLS geçerli"
+                          return name, "WARN", f"HTTP {status} - İçerik alındı"
 
-                          elif status == 403:
-                              result = (
-                                  name,
-                                  "BLOCKED",
-                                  "HTTP 403 - Erişim engellendi"
-                              )
+                  except HTTPError as error:
+                      last_error = f"HTTP {error.code}"
 
-                          elif status in (401, 429, 503):
-                              result = (
-                                  name,
-                                  "WARN",
-                                  f"HTTP {status}"
-                              )
+                      if error.code == 403:
+                          continue
 
-                          else:
-                              result = (
-                                  name,
-                                  "FAIL",
-                                  f"HTTP {status}"
-                              )
+                      if error.code in (401, 429, 503):
+                          return name, "WARN", last_error
 
-                      context.close()
-                      browser.close()
-                      return result
+                      return name, "FAIL", last_error
 
-              except TimeoutError:
-                  last_error = "Tarayıcı zaman aşımına uğradı"
+                  except (URLError, TimeoutError, OSError) as error:
+                      last_error = str(error)
+                      break
 
-              except Exception as error:
-                  last_error = str(error)[:200]
+              if "403" in last_error:
+                  return name, "BLOCKED", "HTTP 403 - Erişim engelli"
 
               return name, "FAIL", last_error
 
           results = []
 
-          with ThreadPoolExecutor(max_workers=3) as executor:
+          print(f"{len(channels)} kanal kontrol ediliyor...")
+
+          with ThreadPoolExecutor(max_workers=20) as executor:
               futures = [
                   executor.submit(check_channel, channel)
                   for channel in channels
               ]
 
               for future in as_completed(futures):
-                  results.append(future.result())
+                  result = future.result()
+                  results.append(result)
+                  print(f"{result[1]} - {result[0]}: {result[2]}")
 
           results.sort(key=lambda x: x[0].casefold())
 
-          ok = [x for x in results if x[1] == "OK"]
-          warn = [x for x in results if x[1] == "WARN"]
-          blocked = [x for x in results if x[1] == "BLOCKED"]
-          failed = [x for x in results if x[1] == "FAIL"]
+          counts = {
+              state: sum(1 for x in results if x[1] == state)
+              for state in ("OK", "WARN", "BLOCKED", "FAIL")
+          }
 
           labels = {
               "OK": "✅ OK",
@@ -197,41 +148,31 @@ jobs:
           }
 
           summary = [
-              "## MHR-1453 TV Chromium Kontrolü",
+              "## MHR-1453 TV Hızlı Kontrol",
               "",
-              f"- Toplam kanal: **{len(channels)}**",
-              f"- Erişilebilir: **{len(ok)}**",
-              f"- Uyarı: **{len(warn)}**",
-              f"- Engellenmiş: **{len(blocked)}**",
-              f"- Hata: **{len(failed)}**",
+              f"- Toplam: **{len(channels)}**",
+              f"- Erişilebilir: **{counts['OK']}**",
+              f"- Uyarı: **{counts['WARN']}**",
+              f"- Engelli: **{counts['BLOCKED']}**",
+              f"- Hata: **{counts['FAIL']}**",
               "",
               "| Kanal | Durum | Açıklama |",
               "|---|---|---|"
           ]
 
           for name, state, detail in results:
-              label = labels[state]
-              print(f"{label} - {name}: {detail}")
-
               summary.append(
-                  f"| {name.replace('|', '/')} | {label} | "
+                  f"| {name.replace('|', '/')} | {labels[state]} | "
                   f"{detail.replace('|', '/')} |"
               )
 
-          summary.extend([
-              "",
-              "> Kontrol Chromium tarayıcısıyla yapılmıştır. "
-              "JavaScript çalıştırılır ve sunucunun gönderdiği "
-              "çerezler tarayıcı oturumunda kullanılabilir. "
-              "Bu test gerçek görüntü ve ses oynatımını garanti etmez."
-          ])
+          summary.append("")
+          summary.append(
+              "> HTTP kontrolüdür; gerçek görüntü ve ses oynatımını garanti etmez."
+          )
 
-          with open(
-              os.environ["GITHUB_STEP_SUMMARY"],
-              "a",
-              encoding="utf-8"
-          ) as output:
-              output.write("\n".join(summary) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(summary) + "\n")
 
           print("\nKontrol tamamlandı!")
           PY
