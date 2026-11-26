@@ -15,20 +15,25 @@ permissions:
 
 jobs:
   validate:
-    name: Hızlı M3U Kontrolü
+    name: Video ve Ses Kontrolü
     runs-on: ubuntu-latest
 
     steps:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: Yayınları kontrol et
+      - name: FFmpeg kurulumu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Yayınları test et
         run: |
           python3 - <<'PY'
           from pathlib import Path
           from concurrent.futures import ThreadPoolExecutor, as_completed
-          from urllib.request import Request, urlopen
-          from urllib.error import HTTPError, URLError
+          import subprocess
+          import json
           import os
 
           file = Path("mhr-1453-tv.m3u")
@@ -52,13 +57,16 @@ jobs:
               if line.startswith("#EXTINF:"):
                   if pending is not None:
                       raise SystemExit("Eksik yayın adresi!")
+
                   pending = line.rsplit(",", 1)[-1].strip() or "İsimsiz kanal"
 
               elif not line.startswith("#"):
                   if pending is None:
                       raise SystemExit("Bağımsız yayın adresi!")
+
                   if not line.startswith(("http://", "https://")):
                       raise SystemExit(f"Geçersiz adres: {pending}")
+
                   channels.append((pending, line))
                   pending = None
 
@@ -68,61 +76,122 @@ jobs:
           if not channels:
               raise SystemExit("Hiç kanal bulunamadı!")
 
-          USER_AGENTS = [
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-              "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36",
-              "VLC/3.0.21 LibVLC/3.0.21"
-          ]
+          USER_AGENT = (
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/131.0.0.0 Safari/537.36"
+          )
 
           def check_channel(channel):
               name, url = channel
-              last_error = "Bilinmeyen hata"
 
-              for ua in USER_AGENTS:
-                  request = Request(
-                      url,
-                      headers={
-                          "User-Agent": ua,
-                          "Accept": "*/*",
-                          "Range": "bytes=0-4095"
-                      }
+              probe_command = [
+                  "ffprobe",
+                  "-v", "error",
+                  "-rw_timeout", "8000000",
+                  "-user_agent", USER_AGENT,
+                  "-show_entries", "stream=codec_type,codec_name",
+                  "-of", "json",
+                  "-i", url
+              ]
+
+              try:
+                  probe = subprocess.run(
+                      probe_command,
+                      capture_output=True,
+                      text=True,
+                      timeout=12
                   )
 
-                  try:
-                      with urlopen(request, timeout=5) as response:
-                          status = response.status
-                          sample = response.read(4096)
+                  if probe.returncode != 0:
+                      error = probe.stderr.lower()
 
-                      if status in (200, 206):
-                          if b"#EXTM3U" in sample:
-                              return name, "OK", f"HTTP {status} - HLS geçerli"
-                          return name, "WARN", f"HTTP {status} - İçerik alındı"
+                      if "403" in error:
+                          return name, "BLOCKED", "HTTP 403 - Erişim engelli"
 
-                  except HTTPError as error:
-                      last_error = f"HTTP {error.code}"
+                      if "401" in error:
+                          return name, "WARN", "HTTP 401 - Yetkilendirme gerekli"
 
-                      if error.code == 403:
-                          continue
+                      return name, "FAIL", "FFprobe: " + probe.stderr[-180:]
 
-                      if error.code in (401, 429, 503):
-                          return name, "WARN", last_error
+                  data = json.loads(probe.stdout)
+                  streams = data.get("streams", [])
 
-                      return name, "FAIL", last_error
+                  video = any(
+                      s.get("codec_type") == "video"
+                      for s in streams
+                  )
 
-                  except (URLError, TimeoutError, OSError) as error:
-                      last_error = str(error)
-                      break
+                  audio = any(
+                      s.get("codec_type") == "audio"
+                      for s in streams
+                  )
 
-              if "403" in last_error:
-                  return name, "BLOCKED", "HTTP 403 - Erişim engelli"
+                  if not video and not audio:
+                      return name, "FAIL", "Ses veya video akışı bulunamadı"
 
-              return name, "FAIL", last_error
+                  decode_command = [
+                      "ffmpeg",
+                      "-nostdin",
+                      "-hide_banner",
+                      "-loglevel", "error",
+                      "-rw_timeout", "8000000",
+                      "-user_agent", USER_AGENT,
+                      "-i", url,
+                      "-t", "5",
+                      "-map", "0:v:0?",
+                      "-map", "0:a:0?",
+                      "-f", "null",
+                      "-"
+                  ]
+
+                  decode = subprocess.run(
+                      decode_command,
+                      capture_output=True,
+                      text=True,
+                      timeout=15
+                  )
+
+                  if decode.returncode != 0:
+                      error = decode.stderr.lower()
+
+                      if "403" in error:
+                          return name, "BLOCKED", "FFmpeg HTTP 403"
+
+                      return name, "FAIL", "Medya çözümlenemedi: " + decode.stderr[-180:]
+
+                  video_text = "Var" if video else "Yok"
+                  audio_text = "Var" if audio else "Yok"
+
+                  codecs = ", ".join(
+                      s.get("codec_name", "?")
+                      for s in streams
+                  )
+
+                  if video and audio:
+                      return (
+                          name,
+                          "OK",
+                          f"Video: {video_text} | Ses: {audio_text} | Codec: {codecs}"
+                      )
+
+                  return (
+                      name,
+                      "PARTIAL",
+                      f"Video: {video_text} | Ses: {audio_text} | Codec: {codecs}"
+                  )
+
+              except subprocess.TimeoutExpired:
+                  return name, "TIMEOUT", "Kontrol zaman aşımına uğradı"
+
+              except Exception as error:
+                  return name, "FAIL", str(error)[:180]
+
+          print(f"Toplam {len(channels)} kanal kontrol edilecek.")
 
           results = []
 
-          print(f"{len(channels)} kanal kontrol ediliyor...")
-
-          with ThreadPoolExecutor(max_workers=20) as executor:
+          with ThreadPoolExecutor(max_workers=5) as executor:
               futures = [
                   executor.submit(check_channel, channel)
                   for channel in channels
@@ -135,44 +204,55 @@ jobs:
 
           results.sort(key=lambda x: x[0].casefold())
 
+          states = [
+              "OK", "PARTIAL", "BLOCKED", "FAIL", "TIMEOUT"
+          ]
+
           counts = {
               state: sum(1 for x in results if x[1] == state)
-              for state in ("OK", "WARN", "BLOCKED", "FAIL")
+              for state in states
           }
 
           labels = {
-              "OK": "✅ OK",
-              "WARN": "⚠️ Uyarı",
+              "OK": "✅ Görüntü + Ses",
+              "PARTIAL": "⚠️ Kısmi",
               "BLOCKED": "🚫 Engellendi",
-              "FAIL": "❌ Hata"
+              "FAIL": "❌ Hata",
+              "TIMEOUT": "⏱️ Zaman aşımı"
           }
 
           summary = [
-              "## MHR-1453 TV Hızlı Kontrol",
+              "## MHR-1453 TV Medya Kontrolü",
               "",
-              f"- Toplam: **{len(channels)}**",
-              f"- Erişilebilir: **{counts['OK']}**",
-              f"- Uyarı: **{counts['WARN']}**",
-              f"- Engelli: **{counts['BLOCKED']}**",
-              f"- Hata: **{counts['FAIL']}**",
+              f"- Toplam kanal: **{len(channels)}**",
+              f"- Görüntü + ses: **{counts['OK']}**",
+              f"- Kısmi akış: **{counts['PARTIAL']}**",
+              f"- Engellenmiş: **{counts['BLOCKED']}**",
+              f"- Hatalı: **{counts['FAIL']}**",
+              f"- Zaman aşımı: **{counts['TIMEOUT']}**",
               "",
-              "| Kanal | Durum | Açıklama |",
+              "| Kanal | Durum | Detay |",
               "|---|---|---|"
           ]
 
           for name, state, detail in results:
               summary.append(
                   f"| {name.replace('|', '/')} | {labels[state]} | "
-                  f"{detail.replace('|', '/')} |"
+                  f"{detail.replace('|', '/').replace(chr(10), ' ')} |"
               )
 
-          summary.append("")
-          summary.append(
-              "> HTTP kontrolüdür; gerçek görüntü ve ses oynatımını garanti etmez."
-          )
+          summary.extend([
+              "",
+              "> FFprobe akışları tespit eder, FFmpeg ilk 5 saniyeyi "
+              "çözümlemeyi dener. Bu test sürekli oynatma garantisi vermez."
+          ])
 
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write("\n".join(summary) + "\n")
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a",
+              encoding="utf-8"
+          ) as output:
+              output.write("\n".join(summary) + "\n")
 
           print("\nKontrol tamamlandı!")
           PY
