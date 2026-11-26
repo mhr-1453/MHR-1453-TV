@@ -1,5 +1,5 @@
 
-name: M3U Otomatik Kontrol
+name: MHR-1453 TV Otomatik Kontrol
 
 on:
   schedule:
@@ -22,13 +22,14 @@ jobs:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: Yayınları kontrol et
+      - name: Python ile yayınları kontrol et
         run: |
           python3 - <<'PY'
           from pathlib import Path
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from urllib.request import Request, urlopen
           from urllib.error import HTTPError, URLError
+          from time import sleep
           import os
 
           file = Path("mhr-1453-tv.m3u")
@@ -52,6 +53,7 @@ jobs:
               if line.startswith("#EXTINF:"):
                   if pending is not None:
                       raise SystemExit("Eksik yayın adresi!")
+
                   pending = line.rsplit(",", 1)[-1].strip() or "İsimsiz kanal"
 
               elif not line.startswith("#"):
@@ -70,40 +72,67 @@ jobs:
           if not channels:
               raise SystemExit("Hiç kanal bulunamadı!")
 
-          print(f"M3U geçerli: {len(channels)} kanal bulundu.")
+          print(f"{len(channels)} kanal bulundu.")
+
+          USER_AGENTS = [
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+              "VLC/3.0.21 LibVLC/3.0.21"
+          ]
 
           def check_channel(channel):
               name, url = channel
+              last_error = "Bilinmeyen hata"
 
-              request = Request(
-                  url,
-                  headers={
-                      "User-Agent": "Mozilla/5.0",
-                      "Range": "bytes=0-4095"
-                  }
-              )
+              for attempt in range(2):
+                  for user_agent in USER_AGENTS:
+                      request = Request(
+                          url,
+                          headers={
+                              "User-Agent": user_agent,
+                              "Accept": "*/*",
+                              "Range": "bytes=0-4095"
+                          }
+                      )
 
-              try:
-                  with urlopen(request, timeout=15) as response:
-                      status = response.status
-                      sample = response.read(4096)
+                      try:
+                          with urlopen(request, timeout=15) as response:
+                              status = response.status
+                              sample = response.read(4096)
 
-                  if 200 <= status < 300:
-                      if b"#EXTM3U" in sample:
-                          return name, "OK", f"HTTP {status} - HLS geçerli"
+                          if status in (200, 206):
+                              if b"#EXTM3U" in sample:
+                                  return name, "OK", f"HTTP {status} - HLS geçerli"
 
-                      return name, "WARN", f"HTTP {status} - HLS doğrulanamadı"
+                              return name, "WARN", f"HTTP {status} - İçerik alındı, HLS doğrulanamadı"
 
-                  return name, "FAIL", f"HTTP {status}"
+                          return name, "WARN", f"HTTP {status}"
 
-              except HTTPError as error:
-                  if error.code in (401, 403, 429):
-                      return name, "WARN", f"HTTP {error.code} - Erişim kısıtlı"
+                      except HTTPError as error:
+                          last_error = f"HTTP {error.code}"
 
-                  return name, "FAIL", f"HTTP {error.code}"
+                          if error.code == 403:
+                              continue
 
-              except (URLError, TimeoutError, OSError) as error:
-                  return name, "FAIL", f"Bağlantı hatası: {error}"
+                          if error.code == 429:
+                              return name, "WARN", "HTTP 429 - İstek sınırı"
+
+                          if error.code == 401:
+                              return name, "WARN", "HTTP 401 - Yetkilendirme gerekli"
+
+                          return name, "FAIL", last_error
+
+                      except (URLError, TimeoutError, OSError) as error:
+                          last_error = str(error)
+                          break
+
+                  if attempt == 0:
+                      sleep(2)
+
+              if "403" in last_error:
+                  return name, "BLOCKED", "Tüm User-Agent denemelerinde HTTP 403"
+
+              return name, "FAIL", last_error
 
           results = []
 
@@ -121,6 +150,7 @@ jobs:
           ok = [x for x in results if x[1] == "OK"]
           warn = [x for x in results if x[1] == "WARN"]
           failed = [x for x in results if x[1] == "FAIL"]
+          blocked = [x for x in results if x[1] == "BLOCKED"]
 
           print("\n===== MHR-1453 TV SONUÇLARI =====")
 
@@ -128,41 +158,50 @@ jobs:
               "## MHR-1453 TV Yayın Kontrolü",
               "",
               f"- Toplam kanal: **{len(channels)}**",
-              f"- Çalışır görünen: **{len(ok)}**",
+              f"- Erişilebilir: **{len(ok)}**",
               f"- Uyarı: **{len(warn)}**",
+              f"- Engellenmiş: **{len(blocked)}**",
               f"- Erişilemeyen: **{len(failed)}**",
               "",
               "| Kanal | Durum | Açıklama |",
               "|---|---|---|"
           ]
 
+          labels = {
+              "OK": "✅ OK",
+              "WARN": "⚠️ Uyarı",
+              "FAIL": "❌ Hata",
+              "BLOCKED": "🚫 Engellendi"
+          }
+
           for name, state, detail in results:
-              label = {
-                  "OK": "✅ OK",
-                  "WARN": "⚠️ Uyarı",
-                  "FAIL": "❌ Hata"
-              }[state]
+              label = labels[state]
 
               print(f"{label} - {name}: {detail}")
 
+              safe_name = name.replace("|", "/")
+              safe_detail = detail.replace("|", "/")
+
               summary.append(
-                  f"| {name.replace('|', '/')} | {label} | {detail} |"
+                  f"| {safe_name} | {label} | {safe_detail} |"
               )
 
-          summary.append("")
-          summary.append(
-              "> Bu test bağlantıyı ve HLS yanıtını kontrol eder. "
-              "Görüntü ve sesin oynatılacağını kesin olarak garanti etmez. "
-              "401, 403 ve 429 yanıtları uyarı olarak değerlendirilir."
-          )
+          summary.extend([
+              "",
+              "> User-Agent denemeleri erişim doğrulaması içindir. "
+              "HTTP 403 erişim engelini, HTTP 206 ise kısmi yanıtı ifade eder. "
+              "Bu kontrol görüntü ve ses oynatımını garanti etmez."
+          ])
 
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a",
+              encoding="utf-8"
+          ) as output:
               output.write("\n".join(summary) + "\n")
 
           if failed:
-              raise SystemExit(
-                  f"{len(failed)} kanal erişilemedi!"
-              )
+              raise SystemExit(f"{len(failed)} kanal erişilemedi!")
 
           print("\nKontrol tamamlandı!")
           PY
