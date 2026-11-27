@@ -1,5 +1,5 @@
 
-name: MHR-1453 TV - DNS HLS Monitor
+name: MHR-1453 TV - Advanced HLS Monitor
 
 on:
   schedule:
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -29,23 +29,21 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          python3 -m pip install --upgrade httpx dnspython
+          sudo apt-get install -y ffmpeg python3-httpx
 
-      - name: DNS and HLS checks
+      - name: Advanced HLS Validation
         run: |
           python3 - <<'PY'
           import os
           import re
           import json
-          import socket
-          import httpx
-          import dns.resolver
+          import time
           import subprocess
-
           from pathlib import Path
-          from urllib.parse import urljoin, urlparse
+          from urllib.parse import urljoin, urlparse, urlunparse
           from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          import httpx
 
           FILE = Path("mhr-1453-tv.m3u")
 
@@ -60,19 +58,18 @@ jobs:
           }
 
           TIMEOUT = httpx.Timeout(
-              connect=8,
-              read=15,
-              write=8,
-              pool=8
+              connect=10,
+              read=20,
+              write=10,
+              pool=10
           )
 
-          MAX_WORKERS = 8
-
-          DNS_SERVERS = [
-              ("Google", "8.8.8.8"),
-              ("Cloudflare", "1.1.1.1"),
-              ("Quad9", "9.9.9.9")
-          ]
+          WORKERS = 8
+          RETRIES = 3
+          MAX_VARIANTS = 3
+          SEGMENTS_TO_TEST = 3
+          MAX_PLAYLIST_SIZE = 1024 * 1024
+          MAX_SEGMENT_SIZE = 65536
 
           if not FILE.exists():
               raise SystemExit("M3U dosyası bulunamadı!")
@@ -102,179 +99,477 @@ jobs:
           if not channels:
               raise SystemExit("Kanal bulunamadı!")
 
-          print("Toplam kanal:", len(channels))
-
-          # DNS-over-HTTPS çözümleme
-          DOH_ENDPOINTS = [
-              ("Google", "https://dns.google/resolve"),
-              ("Cloudflare", "https://cloudflare-dns.com/dns-query")
-          ]
-
-          dns_cache = {}
-
-          def resolve_dns(host):
-              if host in dns_cache:
-                  return dns_cache[host]
-
-              for provider, endpoint in DOH_ENDPOINTS:
-                  try:
-                      headers = {
-                          "accept": "application/dns-json",
-                          "user-agent": USER_AGENT
-                      }
-
-                      response = httpx.get(
-                          endpoint,
-                          params={
-                              "name": host,
-                              "type": "A"
-                          },
-                          headers=headers,
-                          timeout=5
-                      )
-
-                      response.raise_for_status()
-                      data = response.json()
-
-                      if data.get("Status") != 0:
-                          continue
-
-                      addresses = [
-                          item["data"]
-                          for item in data.get("Answer", [])
-                          if item.get("type") == 1
-                      ]
-
-                      if addresses:
-                          dns_cache[host] = (
-                              addresses[0],
-                              provider
-                          )
-
-                          return dns_cache[host]
-
-                  except Exception:
-                      continue
-
-              # Son seçenek: sistem DNS'i
-              try:
-                  addresses = socket.getaddrinfo(
-                      host,
-                      None,
-                      socket.AF_INET
-                  )
-
-                  if addresses:
-                      result = (
-                          addresses[0][4][0],
-                          "Sistem DNS"
-                      )
-
-                      dns_cache[host] = result
-                      return result
-
-              except Exception:
-                  pass
-
-              dns_cache[host] = (None, "Başarısız")
-              return dns_cache[host]
-
           def make_client():
               return httpx.Client(
                   headers=HEADERS,
                   timeout=TIMEOUT,
-                  follow_redirects=True
+                  follow_redirects=True,
+                  limits=httpx.Limits(
+                      max_connections=10,
+                      max_keepalive_connections=5
+                  )
               )
 
-          def fetch(client, url, limit=32768):
-              with client.stream("GET", url) as response:
-                  status = response.status_code
-                  data = bytearray()
+          def inherit_query(parent_url, child_url):
+              """
+              Aynı host üzerindeki göreli segment URL'sine
+              playlist query parametrelerini aktar.
+              """
+              parent = urlparse(parent_url)
+              child = urlparse(child_url)
 
-                  if status in (200, 206):
-                      for chunk in response.iter_bytes(8192):
-                          data.extend(chunk)
+              if (
+                  parent.hostname
+                  and child.hostname
+                  and parent.hostname.lower() == child.hostname.lower()
+                  and not child.query
+                  and parent.query
+              ):
+                  child = child._replace(query=parent.query)
+                  return urlunparse(child)
 
-                          if len(data) >= limit:
-                              break
+              return child_url
 
-                  return status, bytes(data[:limit])
+          def resolve_url(parent, child):
+              result = urljoin(parent, child)
+              return inherit_query(parent, result)
 
-          def hls_check(client, url, depth=0):
-              if depth > 2:
+          def get_bytes(client, url, limit, headers=None):
+              last_error = "Bağlantı kurulamadı"
+
+              for attempt in range(RETRIES):
+                  try:
+                      request_headers = dict(HEADERS)
+
+                      if headers:
+                          request_headers.update(headers)
+
+                      with client.stream(
+                          "GET",
+                          url,
+                          headers=request_headers
+                      ) as response:
+
+                          status = response.status_code
+
+                          if status in (401, 403):
+                              return status, b"", "Yetkilendirme"
+
+                          if status in (404, 410):
+                              last_error = f"HTTP {status}"
+                              if attempt < RETRIES - 1:
+                                  time.sleep(0.7)
+                                  continue
+                              return status, b"", last_error
+
+                          if status not in (200, 206):
+                              last_error = f"HTTP {status}"
+                              if attempt < RETRIES - 1:
+                                  time.sleep(0.7)
+                                  continue
+                              return status, b"", last_error
+
+                          data = bytearray()
+
+                          for chunk in response.iter_bytes(8192):
+                              data.extend(chunk)
+
+                              if len(data) >= limit:
+                                  break
+
+                          if not data:
+                              last_error = "Boş yanıt"
+                              if attempt < RETRIES - 1:
+                                  time.sleep(0.7)
+                                  continue
+                              return status, b"", last_error
+
+                          return status, bytes(data[:limit]), "OK"
+
+                  except Exception as e:
+                      last_error = str(e)[:120]
+
+                      if attempt < RETRIES - 1:
+                          time.sleep(0.7)
+
+              return 0, b"", last_error
+
+          def parse_attributes(line):
+              result = {}
+
+              if ":" not in line:
+                  return result
+
+              content = line.split(":", 1)[1]
+
+              pattern = r'([A-Z0-9-]+)=("[^"]*"|[^,]*)'
+
+              for match in re.finditer(pattern, content):
+                  value = match.group(2).strip()
+
+                  if value.startswith('"') and value.endswith('"'):
+                      value = value[1:-1]
+
+                  result[match.group(1)] = value
+
+              return result
+
+          def is_html(data):
+              start = data[:512].lstrip().lower()
+
+              return (
+                  start.startswith(b"<!doctype html")
+                  or start.startswith(b"<html")
+                  or start.startswith(b"<head")
+                  or start.startswith(b"<body")
+              )
+
+          def check_media_resource(
+              client,
+              url,
+              kind,
+              byte_range=None
+          ):
+              headers = {}
+
+              if byte_range:
+                  headers["Range"] = byte_range
+
+              status, data, detail = get_bytes(
+                  client,
+                  url,
+                  MAX_SEGMENT_SIZE,
+                  headers
+              )
+
+              if status in (401, 403):
+                  return False, f"{kind}: HTTP {status}"
+
+              if status not in (200, 206):
+                  return False, f"{kind}: {detail}"
+
+              if not data:
+                  return False, f"{kind}: boş veri"
+
+              if is_html(data):
+                  return False, f"{kind}: HTML hata sayfası döndü"
+
+              if kind == "KEY":
+                  return True, "Şifreleme anahtarı erişilebilir"
+
+              if kind == "MAP":
+                  if len(data) < 8:
+                      return False, "MAP verisi çok küçük"
+
+                  return True, "Başlangıç segmenti erişilebilir"
+
+              if len(data) < 8:
+                  return False, "Segment verisi çok küçük"
+
+              return True, "Segment erişilebilir"
+
+          def parse_segments(rows):
+              segments = []
+              pending_range = None
+              offsets = {}
+
+              for row in rows:
+                  if row.startswith("#EXT-X-BYTERANGE:"):
+                      pending_range = row.split(":", 1)[1].strip()
+                      continue
+
+                  if row.startswith("#"):
+                      continue
+
+                  byte_range = None
+
+                  if pending_range:
+                      match = re.match(
+                          r"(\d+)(?:@(\d+))?",
+                          pending_range
+                      )
+
+                      if match:
+                          length = int(match.group(1))
+                          uri = row
+
+                          if match.group(2):
+                              offset = int(match.group(2))
+                          else:
+                              offset = offsets.get(uri, 0)
+
+                          byte_range = (
+                              f"bytes={offset}-{offset + length - 1}"
+                          )
+
+                          offsets[uri] = offset + length
+
+                  segments.append((row, byte_range))
+                  pending_range = None
+
+              return segments
+
+          def check_media_playlist(client, url, depth=0):
+              if depth > 3:
                   return False, "Playlist derinliği aşıldı"
 
-              try:
-                  status, data = fetch(client, url)
+              status, data, detail = get_bytes(
+                  client,
+                  url,
+                  MAX_PLAYLIST_SIZE
+              )
 
-                  if status in (401, 403):
-                      return False, f"HTTP {status}"
+              if status in (401, 403):
+                  return False, f"Playlist HTTP {status}"
 
-                  if status not in (200, 206):
-                      return False, f"Playlist HTTP {status}"
+              if status not in (200, 206):
+                  return False, f"Playlist: {detail}"
 
-                  content = data.decode(
-                      "utf-8-sig",
-                      errors="replace"
+              content = data.decode(
+                  "utf-8-sig",
+                  errors="replace"
+              )
+
+              rows = [
+                  x.strip()
+                  for x in content.splitlines()
+                  if x.strip()
+              ]
+
+              if not rows or rows[0] != "#EXTM3U":
+                  return False, "Geçersiz HLS başlığı"
+
+              # Master playlist kontrolü
+              variants = []
+
+              for index, row in enumerate(rows):
+                  if row.startswith("#EXT-X-STREAM-INF:"):
+                      attrs = parse_attributes(row)
+
+                      for next_row in rows[index + 1:]:
+                          if not next_row.startswith("#"):
+                              try:
+                                  bandwidth = int(
+                                      attrs.get("BANDWIDTH", 0)
+                                  )
+                              except ValueError:
+                                  bandwidth = 0
+
+                              variants.append((
+                                  bandwidth,
+                                  resolve_url(url, next_row),
+                                  attrs.get("AUDIO")
+                              ))
+                              break
+
+              if variants:
+                  variants.sort(
+                      key=lambda x: x[0],
+                      reverse=True
                   )
 
-                  rows = [
-                      x.strip()
-                      for x in content.splitlines()
-                      if x.strip()
+                  variant_results = []
+
+                  for bandwidth, variant_url, audio_group in (
+                      variants[:MAX_VARIANTS]
+                  ):
+                      ok, message = check_media_playlist(
+                          client,
+                          variant_url,
+                          depth + 1
+                      )
+
+                      variant_results.append((ok, message))
+
+                  # Alternatif ses playlistleri
+                  audio_results = []
+
+                  for row in rows:
+                      if not row.startswith("#EXT-X-MEDIA:"):
+                          continue
+
+                      attrs = parse_attributes(row)
+
+                      if (
+                          attrs.get("TYPE") == "AUDIO"
+                          and attrs.get("URI")
+                      ):
+                          audio_url = resolve_url(
+                              url,
+                              attrs["URI"]
+                          )
+
+                          audio_ok, audio_message = (
+                              check_media_playlist(
+                                  client,
+                                  audio_url,
+                                  depth + 1
+                              )
+                          )
+
+                          audio_results.append(
+                              (audio_ok, audio_message)
+                          )
+
+                          if len(audio_results) >= 3:
+                              break
+
+                  successful = [
+                      item for item in variant_results
+                      if item[0]
                   ]
 
-                  if not rows or rows[0] != "#EXTM3U":
-                      return False, "Geçersiz HLS"
+                  if successful:
+                      failed_variants = (
+                          len(variant_results) - len(successful)
+                      )
 
-                  for index, row in enumerate(rows):
-                      if row.startswith("#EXT-X-STREAM-INF"):
-                          for next_row in rows[index + 1:]:
-                              if not next_row.startswith("#"):
-                                  return hls_check(
-                                      client,
-                                      urljoin(url, next_row),
-                                      depth + 1
+                      audio_failed = any(
+                          not item[0]
+                          for item in audio_results
+                      )
+
+                      message = (
+                          f"{len(successful)}/{len(variant_results)} "
+                          "video varyantı başarılı"
+                      )
+
+                      if failed_variants:
+                          message += (
+                              f", {failed_variants} varyant başarısız"
+                          )
+
+                      if audio_failed:
+                          message += ", ses playlistinde hata var"
+
+                      return True, message
+
+                  return False, "Bütün video varyantları başarısız"
+
+              # Medya playlisti
+              segment_list = parse_segments(rows)
+
+              if not segment_list:
+                  return False, "Medya segmenti bulunamadı"
+
+              # Şifreleme anahtarlarını kontrol et
+              key_results = []
+
+              for row in rows:
+                  if not row.startswith("#EXT-X-KEY:"):
+                      continue
+
+                  attrs = parse_attributes(row)
+
+                  if attrs.get("METHOD") == "NONE":
+                      continue
+
+                  key_uri = attrs.get("URI")
+
+                  if key_uri:
+                      key_url = resolve_url(url, key_uri)
+
+                      ok, message = check_media_resource(
+                          client,
+                          key_url,
+                          "KEY"
+                      )
+
+                      key_results.append((ok, message))
+
+              failed_keys = [
+                  item for item in key_results
+                  if not item[0]
+              ]
+
+              if failed_keys:
+                  return False, failed_keys[0][1]
+
+              # fMP4 başlangıç segmenti
+              for row in rows:
+                  if row.startswith("#EXT-X-MAP:"):
+                      attrs = parse_attributes(row)
+                      map_uri = attrs.get("URI")
+
+                      if map_uri:
+                          map_url = resolve_url(url, map_uri)
+
+                          byte_range = attrs.get("BYTERANGE")
+                          range_header = None
+
+                          if byte_range:
+                              match = re.match(
+                                  r"(\d+)(?:@(\d+))?",
+                                  byte_range
+                              )
+
+                              if match:
+                                  length = int(match.group(1))
+                                  offset = int(
+                                      match.group(2) or 0
                                   )
 
-                  segments = [
-                      row for row in rows
-                      if not row.startswith("#")
-                  ]
+                                  range_header = (
+                                      f"bytes={offset}-"
+                                      f"{offset + length - 1}"
+                                  )
 
-                  if not segments:
-                      return False, "Segment bulunamadı"
+                          ok, message = check_media_resource(
+                              client,
+                              map_url,
+                              "MAP",
+                              range_header
+                          )
 
-                  segment_url = urljoin(url, segments[0])
+                          if not ok:
+                              return False, message
 
-                  seg_status, seg_data = fetch(
+              # İlk 3 segmenti kontrol et
+              selected = segment_list[:SEGMENTS_TO_TEST]
+
+              success_count = 0
+              errors = []
+
+              for segment, byte_range in selected:
+                  segment_url = resolve_url(url, segment)
+
+                  ok, message = check_media_resource(
                       client,
                       segment_url,
-                      16384
+                      "SEGMENT",
+                      byte_range
                   )
 
-                  if seg_status in (401, 403):
-                      return False, f"Segment HTTP {seg_status}"
+                  if ok:
+                      success_count += 1
+                  else:
+                      errors.append(message)
 
-                  if seg_status not in (200, 206):
-                      return False, f"Segment HTTP {seg_status}"
+              if success_count == len(selected):
+                  return True, (
+                      f"{success_count}/{len(selected)} "
+                      "segment başarılı"
+                  )
 
-                  if not seg_data:
-                      return False, "Boş segment"
+              if success_count > 0:
+                  return True, (
+                      f"KISMİ: {success_count}/{len(selected)} "
+                      "segment başarılı | " + "; ".join(errors)
+                  )
 
-                  return True, "HLS playlist ve segment erişilebilir"
-
-              except Exception as e:
-                  return False, str(e)[:100]
+              return False, (
+                  "Segmentlerin tamamı başarısız | "
+                  + "; ".join(errors)
+              )
 
           def probe_test(url):
               cmd = [
                   "ffprobe",
                   "-v", "error",
-                  "-rw_timeout", "12000000",
+                  "-rw_timeout", "20000000",
                   "-user_agent", USER_AGENT,
-                  "-probesize", "2000000",
-                  "-analyzeduration", "2000000",
+                  "-probesize", "3000000",
+                  "-analyzeduration", "3000000",
                   "-show_entries",
                   "stream=codec_type,codec_name",
                   "-of", "json",
@@ -286,7 +581,7 @@ jobs:
                       cmd,
                       capture_output=True,
                       text=True,
-                      timeout=15
+                      timeout=25
                   )
 
                   if result.returncode != 0:
@@ -317,10 +612,10 @@ jobs:
                   "-nostdin",
                   "-hide_banner",
                   "-loglevel", "error",
-                  "-rw_timeout", "12000000",
+                  "-rw_timeout", "20000000",
                   "-user_agent", USER_AGENT,
                   "-i", url,
-                  "-t", "3",
+                  "-t", "4",
                   "-map", "0:v:0?",
                   "-map", "0:a:0?",
                   "-f", "null",
@@ -332,7 +627,7 @@ jobs:
                       cmd,
                       capture_output=True,
                       text=True,
-                      timeout=18
+                      timeout=30
                   )
 
                   return result.returncode == 0
@@ -344,107 +639,109 @@ jobs:
               name, url = channel
 
               try:
-                  host = urlparse(url).hostname
+                  parsed = urlparse(url)
 
-                  if not host:
+                  if parsed.scheme not in ("http", "https"):
                       return (
                           name,
                           "GEÇERSİZ URL",
-                          "Alan adı bulunamadı",
-                          "-"
+                          "HTTP/HTTPS adresi değil"
                       )
-
-                  ip, provider = resolve_dns(host)
-
-                  if not ip:
-                      return (
-                          name,
-                          "DNS HATASI",
-                          "Google, Cloudflare ve sistem DNS başarısız",
-                          "Başarısız"
-                      )
-
-                  print(
-                      f"DNS OK | {name} | {provider} | {ip}"
-                  )
 
                   with make_client() as client:
-                      status, data = fetch(client, url)
-
-                      if status in (401, 403):
-                          return (
-                              name,
-                              "YETKİLENDİRME",
-                              f"HTTP {status}",
-                              provider
-                          )
-
-                      if status in (404, 410):
-                          return (
-                              name,
-                              "KANAL HATASI",
-                              f"HTTP {status}",
-                              provider
-                          )
-
-                      if status not in (200, 206):
-                          return (
-                              name,
-                              "BAĞLANTI HATASI",
-                              f"HTTP {status}",
-                              provider
-                          )
-
                       is_hls = (
                           ".m3u8" in url.lower()
-                          or data.lstrip().startswith(b"#EXTM3U")
                       )
 
                       if is_hls:
-                          ok, detail = hls_check(client, url)
+                          hls_ok, hls_message = (
+                              check_media_playlist(client, url)
+                          )
 
-                          if not ok:
+                          if not hls_ok:
                               return (
                                   name,
                                   "HLS HATASI",
-                                  detail,
-                                  provider
+                                  hls_message
                               )
+
+                      else:
+                          status, data, detail = get_bytes(
+                              client,
+                              url,
+                              32768
+                          )
+
+                          if status in (401, 403):
+                              return (
+                                  name,
+                                  "YETKİLENDİRME",
+                                  f"HTTP {status}"
+                              )
+
+                          if status not in (200, 206):
+                              return (
+                                  name,
+                                  "BAĞLANTI HATASI",
+                                  detail
+                              )
+
+                          if data.lstrip().startswith(b"#EXTM3U"):
+                              hls_ok, hls_message = (
+                                  check_media_playlist(client, url)
+                              )
+
+                              if not hls_ok:
+                                  return (
+                                      name,
+                                      "HLS HATASI",
+                                      hls_message
+                                  )
+
+                              hls_message = hls_message
+
+                          else:
+                              hls_message = "HTTP erişilebilir"
 
                   probe_ok, video, audio = probe_test(url)
                   ff_ok = ffmpeg_test(url)
 
                   if probe_ok and video and audio and ff_ok:
-                      state = "BAŞARILI"
-                      detail = "Ses ve görüntü doğrulandı"
-
-                  elif probe_ok or ff_ok:
-                      state = "KISMİ"
-                      detail = (
-                          f"Video: {video} | Ses: {audio}"
+                      return (
+                          name,
+                          "BAŞARILI",
+                          hls_message + " | Ses ve görüntü doğrulandı"
                       )
 
-                  else:
-                      state = "ERİŞİLEBİLİR"
-                      detail = (
-                          "HTTP/HLS erişilebilir, medya "
-                          "çözümlemesi doğrulanamadı"
+                  if probe_ok or ff_ok:
+                      return (
+                          name,
+                          "KISMİ",
+                          hls_message + (
+                              f" | Video: {video}, Ses: {audio}"
+                          )
                       )
 
-                  return name, state, detail, provider
+                  return (
+                      name,
+                      "ERİŞİLEBİLİR",
+                      hls_message + " | Medya çözümlemesi doğrulanamadı"
+                  )
 
               except Exception as e:
                   return (
                       name,
                       "KONTROL HATASI",
-                      str(e)[:100],
-                      "-"
+                      str(e)[:150]
                   )
+
+          print(f"Toplam kanal: {len(channels)}")
+          print("Gelişmiş HLS kontrolü başlıyor...\n")
 
           results = []
 
           with ThreadPoolExecutor(
-              max_workers=MAX_WORKERS
+              max_workers=WORKERS
           ) as executor:
 
               futures = [
@@ -463,22 +760,23 @@ jobs:
                       )
 
                   except Exception as e:
-                      print("Hata:", str(e)[:100])
+                      print("Kontrol hatası:", str(e)[:100])
 
           results.sort(key=lambda x: x[0].casefold())
 
           counts = {}
 
-          for name, state, detail, provider in results:
+          for name, state, detail in results:
               counts[state] = counts.get(state, 0) + 1
 
           summary = [
-              "# MHR-1453 TV - DNS HLS Raporu",
+              "# MHR-1453 TV - Gelişmiş HLS Raporu",
               "",
               f"- Toplam kanal: {len(channels)}",
               f"- Kontrol edilen: {len(results)}",
-              f"- Paralel işçi: {MAX_WORKERS}",
-              "- DNS: Google DoH / Cloudflare DoH / Sistem DNS",
+              f"- Paralel işçi: {WORKERS}",
+              f"- Segment kontrolü: İlk {SEGMENTS_TO_TEST}",
+              f"- Tekrar deneme: {RETRIES}",
               ""
           ]
 
@@ -487,24 +785,25 @@ jobs:
 
           summary.extend([
               "",
-              "| Kanal | Durum | Detay | DNS |",
-              "|---|---|---|---|"
+              "| Kanal | Durum | Detay |",
+              "|---|---|---|"
           ])
 
-          for name, state, detail, provider in results:
+          for name, state, detail in results:
+              name = name.replace("|", "/")
+              detail = detail.replace("|", "/")
+
               summary.append(
-                  f"| {name.replace('|', '/')} "
-                  f"| {state} "
-                  f"| {detail.replace('|', '/')} "
-                  f"| {provider} |"
+                  f"| {name} | {state} | {detail} |"
               )
 
           summary.extend([
               "",
-              "> DNS çözümlemesi başarılı olması yayının "
-              "oynatılabildiğini garanti etmez.",
+              "> HLS segmentleri, başlangıç segmentleri ve "
+              "şifreleme anahtarları kontrol edilmiştir.",
               "",
-              "> HTTP 401/403 DNS değiştirerek giderilemez."
+              "> Erişim testi başarılı olması yayının her "
+              "oynatıcıda çalışacağını garanti etmez."
           ])
 
           with open(
