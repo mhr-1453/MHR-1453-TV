@@ -15,36 +15,53 @@ permissions:
 
 jobs:
   validate:
-    name: Video ve Ses Kontrolü
+    name: Hibrit Yayın Kontrolü
     runs-on: ubuntu-latest
 
     steps:
       - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: FFmpeg kurulumu
+      - name: FFmpeg ve HTTPX kurulumu
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+          python3 -m pip install httpx --break-system-packages
 
-      - name: Yayınları test et
+      - name: Yayınları kontrol et
         run: |
           python3 - <<'PY'
           from pathlib import Path
           from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.parse import urljoin
           import subprocess
+          import httpx
           import json
           import os
           import time
 
-          file = Path("mhr-1453-tv.m3u")
+          FILE = Path("mhr-1453-tv.m3u")
 
-          if not file.exists():
+          USER_AGENT = (
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/131.0.0.0 Safari/537.36"
+          )
+
+          HEADERS = {
+              "User-Agent": USER_AGENT,
+              "Accept": "*/*",
+              "Connection": "keep-alive"
+          }
+
+          if not FILE.exists():
               raise SystemExit("M3U dosyası bulunamadı!")
 
           lines = [
               x.strip()
-              for x in file.read_text(encoding="utf-8-sig").splitlines()
+              for x in FILE.read_text(
+                  encoding="utf-8-sig"
+              ).splitlines()
               if x.strip()
           ]
 
@@ -59,14 +76,19 @@ jobs:
                   if pending is not None:
                       raise SystemExit("Eksik yayın adresi!")
 
-                  pending = line.rsplit(",", 1)[-1].strip() or "İsimsiz kanal"
+                  pending = (
+                      line.rsplit(",", 1)[-1].strip()
+                      or "İsimsiz kanal"
+                  )
 
               elif not line.startswith("#"):
                   if pending is None:
                       raise SystemExit("Bağımsız yayın adresi!")
 
                   if not line.startswith(("http://", "https://")):
-                      raise SystemExit(f"Geçersiz adres: {pending}")
+                      raise SystemExit(
+                          f"Geçersiz adres: {pending}"
+                      )
 
                   channels.append((pending, line))
                   pending = None
@@ -77,134 +99,331 @@ jobs:
           if not channels:
               raise SystemExit("Hiç kanal bulunamadı!")
 
-          USER_AGENT = (
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/131.0.0.0 Safari/537.36"
-          )
+          def http_check(url):
+              try:
+                  with httpx.Client(
+                      headers=HEADERS,
+                      follow_redirects=True,
+                      timeout=12
+                  ) as client:
+
+                      with client.stream(
+                          "GET",
+                          url,
+                          headers={"Range": "bytes=0-4095"}
+                      ) as response:
+
+                          status = response.status_code
+
+                          if status in (401, 403):
+                              return "BLOCKED", f"HTTP {status}"
+
+                          if status == 404 or status >= 500:
+                              return "FAIL", f"HTTP {status}"
+
+                          if status not in (200, 206):
+                              return "SUSPECT", f"HTTP {status}"
+
+                          content = b""
+
+                          for chunk in response.iter_bytes(
+                              chunk_size=4096
+                          ):
+                              content += chunk
+
+                              if len(content) >= 65536:
+                                  break
+
+                          content_type = response.headers.get(
+                              "content-type", ""
+                          ).lower()
+
+                          is_hls = (
+                              ".m3u8" in url.lower()
+                              or "mpegurl" in content_type
+                              or content.lstrip().startswith(b"#EXTM3U")
+                          )
+
+                          if not content:
+                              return "SUSPECT", "Boş HTTP yanıtı"
+
+                          if is_hls:
+                              return hls_check(
+                                  client, url, content
+                              )
+
+                          return "OK", f"HTTP {status}"
+
+              except httpx.TimeoutException:
+                  return "SUSPECT", "HTTP zaman aşımı"
+
+              except httpx.RequestError as error:
+                  return "SUSPECT", str(error)[:120]
+
+              except Exception as error:
+                  return "SUSPECT", str(error)[:120]
+
+          def hls_check(client, base_url, content):
+              try:
+                  text = content.decode(
+                      "utf-8-sig", errors="replace"
+                  )
+
+                  lines = [
+                      x.strip()
+                      for x in text.splitlines()
+                      if x.strip()
+                  ]
+
+                  if not lines or lines[0] != "#EXTM3U":
+                      return "SUSPECT", "Geçersiz HLS playlist"
+
+                  variants = [
+                      line for line in lines
+                      if not line.startswith("#")
+                  ]
+
+                  if not variants:
+                      return "SUSPECT", "HLS segmenti bulunamadı"
+
+                  target = urljoin(base_url, variants[0])
+
+                  # Master playlist ise ilk alt playlisti kontrol et.
+                  if any(
+                      "#EXT-X-STREAM-INF" in line
+                      for line in lines
+                  ):
+                      with client.stream(
+                          "GET", target
+                      ) as response:
+
+                          if response.status_code in (401, 403):
+                              return "BLOCKED", (
+                                  f"Alt playlist HTTP "
+                                  f"{response.status_code}"
+                              )
+
+                          if response.status_code not in (200, 206):
+                              return "SUSPECT", (
+                                  f"Alt playlist HTTP "
+                                  f"{response.status_code}"
+                              )
+
+                          data = b""
+                          for chunk in response.iter_bytes(
+                              chunk_size=4096
+                          ):
+                              data += chunk
+                              if len(data) >= 65536:
+                                  break
+
+                      child = data.decode(
+                          "utf-8-sig", errors="replace"
+                      )
+
+                      child_lines = [
+                          x.strip()
+                          for x in child.splitlines()
+                          if x.strip()
+                      ]
+
+                      if not child_lines or child_lines[0] != "#EXTM3U":
+                          return "SUSPECT", "Alt HLS playlist hatalı"
+
+                      segments = [
+                          x for x in child_lines
+                          if not x.startswith("#")
+                      ]
+
+                      if not segments:
+                          return "SUSPECT", "Alt playlist boş"
+
+                      target = urljoin(target, segments[0])
+
+                  # İlk medya segmentinin erişimini kontrol et.
+                  with client.stream(
+                      "GET",
+                      target,
+                      headers={"Range": "bytes=0-1023"}
+                  ) as response:
+
+                      if response.status_code in (401, 403):
+                          return "BLOCKED", (
+                              f"Segment HTTP {response.status_code}"
+                          )
+
+                      if response.status_code not in (200, 206):
+                          return "SUSPECT", (
+                              f"Segment HTTP {response.status_code}"
+                          )
+
+                      first_data = next(
+                          response.iter_bytes(1024),
+                          b""
+                      )
+
+                      if not first_data:
+                          return "SUSPECT", "Boş medya segmenti"
+
+                  return "OK", "HLS playlist + segment erişilebilir"
+
+              except Exception as error:
+                  return "SUSPECT", (
+                      f"HLS kontrolü: {str(error)[:120]}"
+                  )
+
+          def media_check(url):
+              probe_command = [
+                  "ffprobe",
+                  "-v", "error",
+                  "-rw_timeout", "15000000",
+                  "-user_agent", USER_AGENT,
+                  "-probesize", "5000000",
+                  "-analyzeduration", "5000000",
+                  "-show_entries",
+                  "stream=codec_type,codec_name",
+                  "-of", "json",
+                  "-i", url
+              ]
+
+              try:
+                  probe = subprocess.run(
+                      probe_command,
+                      capture_output=True,
+                      text=True,
+                      timeout=25
+                  )
+
+                  if probe.returncode != 0:
+                      error = probe.stderr.lower()
+
+                      if "403" in error:
+                          return "BLOCKED", "FFprobe HTTP 403"
+
+                      if "401" in error:
+                          return "BLOCKED", "FFprobe HTTP 401"
+
+                      return "SUSPECT", (
+                          "FFprobe: " + probe.stderr[-150:]
+                      )
+
+                  data = json.loads(probe.stdout)
+                  streams = data.get("streams", [])
+
+                  video = any(
+                      x.get("codec_type") == "video"
+                      for x in streams
+                  )
+
+                  audio = any(
+                      x.get("codec_type") == "audio"
+                      for x in streams
+                  )
+
+                  if not video and not audio:
+                      return "SUSPECT", "Medya akışı bulunamadı"
+
+                  decode_command = [
+                      "ffmpeg",
+                      "-nostdin",
+                      "-hide_banner",
+                      "-loglevel", "error",
+                      "-rw_timeout", "15000000",
+                      "-user_agent", USER_AGENT,
+                      "-i", url,
+                      "-t", "10",
+                      "-map", "0:v:0?",
+                      "-map", "0:a:0?",
+                      "-f", "null",
+                      "-"
+                  ]
+
+                  decode = subprocess.run(
+                      decode_command,
+                      capture_output=True,
+                      text=True,
+                      timeout=35
+                  )
+
+                  if decode.returncode != 0:
+                      error = decode.stderr.lower()
+
+                      if "403" in error:
+                          return "BLOCKED", "FFmpeg HTTP 403"
+
+                      return "SUSPECT", (
+                          "FFmpeg: " + decode.stderr[-150:]
+                      )
+
+                  codecs = ", ".join(
+                      x.get("codec_name", "?")
+                      for x in streams
+                  )
+
+                  if video and audio:
+                      return "OK", (
+                          f"Ses + görüntü doğrulandı | "
+                          f"10 saniye test | {codecs}"
+                      )
+
+                  return "WARN", (
+                      f"Video: {'Var' if video else 'Yok'} | "
+                      f"Ses: {'Var' if audio else 'Yok'}"
+                  )
+
+              except subprocess.TimeoutExpired:
+                  return "SUSPECT", "Medya testi zaman aşımı"
+
+              except Exception as error:
+                  return "SUSPECT", str(error)[:150]
 
           def check_channel(channel):
               name, url = channel
-              last_error = "Bilinmeyen hata"
+              last_result = ("SUSPECT", "Bilinmeyen hata")
 
               for attempt in range(2):
-                  try:
-                      probe_command = [
-                          "ffprobe",
-                          "-v", "error",
-                          "-rw_timeout", "15000000",
-                          "-user_agent", USER_AGENT,
-                          "-show_entries",
-                          "stream=codec_type,codec_name",
-                          "-of", "json",
-                          "-i", url
-                      ]
+                  http_state, http_detail = http_check(url)
 
-                      probe = subprocess.run(
-                          probe_command,
-                          capture_output=True,
-                          text=True,
-                          timeout=20
+                  if http_state in ("BLOCKED", "FAIL"):
+                      last_result = (http_state, http_detail)
+
+                  elif http_state == "SUSPECT":
+                      last_result = (
+                          "SUSPECT",
+                          "HTTP: " + http_detail
                       )
 
-                      if probe.returncode != 0:
-                          error = probe.stderr.lower()
+                  else:
+                      media_state, media_detail = media_check(url)
 
-                          if "403" in error:
-                              return name, "BLOCKED", "HTTP 403 - Erişim engelli"
+                      if media_state == "OK":
+                          return name, "OK", media_detail
 
-                          if "401" in error:
-                              return name, "WARN", "HTTP 401 - Yetkilendirme gerekli"
+                      if media_state == "WARN":
+                          return name, "WARN", media_detail
 
-                          last_error = probe.stderr[-180:]
-
+                      if media_state == "BLOCKED":
+                          last_result = (
+                              "SUSPECT",
+                              "HTTP erişilebilir, medya erişimi engelli"
+                          )
                       else:
-                          data = json.loads(probe.stdout)
-                          streams = data.get("streams", [])
-
-                          video = any(
-                              s.get("codec_type") == "video"
-                              for s in streams
+                          last_result = (
+                              "SUSPECT",
+                              media_detail
                           )
-
-                          audio = any(
-                              s.get("codec_type") == "audio"
-                              for s in streams
-                          )
-
-                          if video or audio:
-                              decode_command = [
-                                  "ffmpeg",
-                                  "-nostdin",
-                                  "-hide_banner",
-                                  "-loglevel", "error",
-                                  "-rw_timeout", "15000000",
-                                  "-user_agent", USER_AGENT,
-                                  "-i", url,
-                                  "-t", "10",
-                                  "-map", "0:v:0?",
-                                  "-map", "0:a:0?",
-                                  "-f", "null",
-                                  "-"
-                              ]
-
-                              decode = subprocess.run(
-                                  decode_command,
-                                  capture_output=True,
-                                  text=True,
-                                  timeout=25
-                              )
-
-                              if decode.returncode == 0:
-                                  codecs = ", ".join(
-                                      s.get("codec_name", "?")
-                                      for s in streams
-                                  )
-
-                                  if video and audio:
-                                      return (
-                                          name,
-                                          "OK",
-                                          f"Video: Var | Ses: Var | "
-                                          f"10 saniye test edildi | {codecs}"
-                                      )
-
-                                  last_error = (
-                                      f"Video: {'Var' if video else 'Yok'} | "
-                                      f"Ses: {'Var' if audio else 'Yok'}"
-                                  )
-
-                              else:
-                                  error = decode.stderr.lower()
-
-                                  if "403" in error:
-                                      return name, "BLOCKED", "FFmpeg HTTP 403"
-
-                                  last_error = decode.stderr[-180:]
-
-                          else:
-                              last_error = "Video ve ses akışı bulunamadı"
-
-                  except subprocess.TimeoutExpired:
-                      last_error = "Medya testi zaman aşımına uğradı"
-
-                  except Exception as error:
-                      last_error = str(error)[:180]
 
                   if attempt == 0:
                       print(
-                          f"{name}: Akış doğrulanamadı, "
-                          "2 saniye sonra tekrar deneniyor..."
+                          f"{name}: Tekrar kontrol ediliyor..."
                       )
                       time.sleep(2)
 
-              return (
-                  name,
-                  "FAIL",
-                  f"İkinci denemede de doğrulanamadı: {last_error}"
-              )
+              return name, last_result[0], last_result[1]
 
-          print(f"Toplam {len(channels)} kanal kontrol edilecek.")
+          print(
+              f"Toplam {len(channels)} kanal kontrol edilecek."
+          )
 
           results = []
 
@@ -217,49 +436,65 @@ jobs:
               for future in as_completed(futures):
                   result = future.result()
                   results.append(result)
-                  print(f"{result[1]} - {result[0]}: {result[2]}")
+
+                  print(
+                      f"{result[1]} - {result[0]}: {result[2]}"
+                  )
 
           results.sort(key=lambda x: x[0].casefold())
 
-          states = ["OK", "WARN", "BLOCKED", "FAIL"]
+          states = ["OK", "WARN", "SUSPECT", "BLOCKED", "FAIL"]
 
           counts = {
-              state: sum(1 for x in results if x[1] == state)
+              state: sum(
+                  1 for result in results
+                  if result[1] == state
+              )
               for state in states
           }
 
           labels = {
-              "OK": "✅ Görüntü + Ses",
-              "WARN": "⚠️ Uyarı",
-              "BLOCKED": "🚫 Engellendi",
-              "FAIL": "❌ Hata"
+              "OK": "✅ Çalışıyor",
+              "WARN": "⚠️ Kısmi akış",
+              "SUSPECT": "❔ Şüpheli",
+              "BLOCKED": "🚫 Erişim engelli",
+              "FAIL": "❌ Erişim hatası"
           }
 
           summary = [
-              "## MHR-1453 TV Medya Kontrolü",
+              "## MHR-1453 TV Hibrit Kontrol",
               "",
               f"- Toplam kanal: **{len(channels)}**",
-              f"- Görüntü + ses: **{counts['OK']}**",
-              f"- Uyarı: **{counts['WARN']}**",
-              f"- Engellenmiş: **{counts['BLOCKED']}**",
-              f"- Hatalı: **{counts['FAIL']}**",
+              f"- Çalışıyor: **{counts['OK']}**",
+              f"- Kısmi akış: **{counts['WARN']}**",
+              f"- Şüpheli: **{counts['SUSPECT']}**",
+              f"- Erişim engelli: **{counts['BLOCKED']}**",
+              f"- Erişim hatası: **{counts['FAIL']}**",
               "",
               "| Kanal | Durum | Detay |",
               "|---|---|---|"
           ]
 
           for name, state, detail in results:
+              safe_name = name.replace("|", "/")
+              safe_detail = (
+                  detail.replace("|", "/")
+                  .replace("\n", " ")
+              )
+
               summary.append(
-                  f"| {name.replace('|', '/')} | "
-                  f"{labels[state]} | "
-                  f"{detail.replace('|', '/').replace(chr(10), ' ')} |"
+                  f"| {safe_name} | "
+                  f"{labels[state]} | {safe_detail} |"
               )
 
           summary.extend([
               "",
-              "> FFprobe akışları tespit eder. FFmpeg 10 saniyelik "
-              "medya bölümünü çözümlemeyi dener. Başarılı sonuç "
-              "sürekli oynatma garantisi vermez."
+              "> HTTP kontrolü erişimi, HLS kontrolü playlist ve "
+              "segmentleri, FFprobe akışları, FFmpeg ise medya "
+              "çözümlemesini test eder.",
+              "",
+              "> Başarılı test sürekli yayın garantisi vermez. "
+              "Şüpheli sonuçlar doğrudan bozuk kanal anlamına gelmez."
           ])
 
           with open(
