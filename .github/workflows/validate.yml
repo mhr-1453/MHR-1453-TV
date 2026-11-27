@@ -20,7 +20,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Depoyu indir
@@ -49,7 +49,6 @@ jobs:
           import httpx
           import json
           import os
-          import time
           import re
 
           FILE = Path("mhr-1453-tv.m3u")
@@ -71,10 +70,10 @@ jobs:
           }
 
           TIMEOUT = httpx.Timeout(
-              connect=8,
-              read=12,
-              write=8,
-              pool=8
+              connect=20,
+              read=40,
+              write=20,
+              pool=20
           )
 
           if not FILE.exists():
@@ -106,7 +105,7 @@ jobs:
           if not channels:
               raise SystemExit("Kanal bulunamadı!")
 
-          # Proxy listesini al
+          # Proxy listesini indir
           print("Proxy listesi indiriliyor...")
 
           proxy_candidates = []
@@ -114,7 +113,7 @@ jobs:
           try:
               r = httpx.get(
                   PROXY_LIST,
-                  timeout=25,
+                  timeout=40,
                   follow_redirects=True
               )
               r.raise_for_status()
@@ -144,7 +143,7 @@ jobs:
                   with httpx.Client(
                       proxy=proxy,
                       headers=HEADERS,
-                      timeout=7,
+                      timeout=20,
                       follow_redirects=True
                   ) as client:
                       r = client.get("https://api.ipify.org")
@@ -159,10 +158,10 @@ jobs:
 
           working_proxies = []
 
-          with ThreadPoolExecutor(max_workers=25) as pool:
+          with ThreadPoolExecutor(max_workers=12) as pool:
               futures = [
                   pool.submit(test_proxy, p)
-                  for p in proxy_candidates[:250]
+                  for p in proxy_candidates[:500]
               ]
 
               for future in as_completed(futures):
@@ -205,7 +204,7 @@ jobs:
 
                   return status, bytes(data[:limit])
 
-          # HLS playlist, alt playlist, segment ve anahtar kontrolü
+          # HLS kontrolü
           def hls_check(client, url, depth=0):
               try:
                   if depth > 2:
@@ -245,7 +244,7 @@ jobs:
                                       depth + 1
                                   )
 
-                  # Alternatif medya playlisti
+                  # Ses playlistleri
                   for row in rows:
                       if row.startswith("#EXT-X-MEDIA:"):
                           match = re.search(
@@ -259,20 +258,18 @@ jobs:
                                   match.group(1)
                               )
 
-                              if "TYPE=AUDIO" in row:
-                                  media_status, media_data = fetch(
-                                      client,
-                                      media_url
+                              media_status, _ = fetch(
+                                  client,
+                                  media_url
+                              )
+
+                              if media_status in (401, 403):
+                                  return (
+                                      "Yetkilendirme",
+                                      f"Ses playlist HTTP {media_status}"
                                   )
 
-                                  if media_status not in (200, 206):
-                                      if media_status in (401, 403):
-                                          return (
-                                              "Yetkilendirme",
-                                              f"Ses playlist HTTP {media_status}"
-                                          )
-
-                  # Şifreleme anahtarları
+                  # HLS şifreleme anahtarı erişim kontrolü
                   key_count = 0
 
                   for row in rows:
@@ -284,7 +281,7 @@ jobs:
 
                           if match:
                               key_url = urljoin(url, match.group(1))
-                              key_status, key_data = fetch(
+                              key_status, _ = fetch(
                                   client,
                                   key_url,
                                   4096
@@ -304,7 +301,7 @@ jobs:
 
                               key_count += 1
 
-                  # İlk üç medya segmenti
+                  # İlk üç segment
                   segments = [
                       row for row in rows
                       if not row.startswith("#")
@@ -321,7 +318,7 @@ jobs:
                       seg_status, seg_data = fetch(
                           client,
                           segment_url,
-                          4096
+                          16384
                       )
 
                       if seg_status in (401, 403):
@@ -343,19 +340,16 @@ jobs:
 
                   return (
                       "OK",
-                      f"{checked} segment kontrol edildi, "
-                      f"{key_count} anahtar kontrol edildi"
+                      f"{checked} segment, {key_count} anahtar kontrol edildi"
                   )
 
               except Exception as e:
                   return "Şüpheli", str(e)[:120]
 
-          # HTTP ve HLS testi
+          # HTTP ve HLS
           def http_test(url, proxy=None):
               try:
                   with request_client(proxy) as client:
-                      content_type = ""
-
                       status, content = fetch(client, url)
 
                       if status in (401, 403):
@@ -373,12 +367,7 @@ jobs:
                       )
 
                       if is_hls:
-                          state, detail = hls_check(
-                              client,
-                              url
-                          )
-
-                          return state, detail
+                          return hls_check(client, url)
 
                       return "OK", "HTTP erişilebilir"
 
@@ -390,8 +379,10 @@ jobs:
               cmd = [
                   "ffprobe",
                   "-v", "error",
-                  "-rw_timeout", "15000000",
+                  "-rw_timeout", "30000000",
                   "-user_agent", USER_AGENT,
+                  "-probesize", "10000000",
+                  "-analyzeduration", "10000000",
                   "-show_entries",
                   "stream=codec_type,codec_name",
                   "-of", "json"
@@ -407,7 +398,7 @@ jobs:
                       cmd,
                       capture_output=True,
                       text=True,
-                      timeout=25
+                      timeout=60
                   )
 
                   if r.returncode != 0:
@@ -434,18 +425,23 @@ jobs:
                       "FFprobe başarılı"
                   )
 
+              except subprocess.TimeoutExpired:
+                  return False, False, False, "FFprobe zaman aşımı"
+
               except Exception:
                   return False, False, False, "FFprobe hatası"
 
-          # FFmpeg medya çözümleme
+          # FFmpeg
           def ffmpeg_test(url, proxy=None):
               cmd = [
                   "ffmpeg",
                   "-nostdin",
                   "-hide_banner",
                   "-loglevel", "error",
-                  "-rw_timeout", "15000000",
-                  "-user_agent", USER_AGENT
+                  "-rw_timeout", "30000000",
+                  "-user_agent", USER_AGENT,
+                  "-probesize", "10000000",
+                  "-analyzeduration", "10000000"
               ]
 
               if proxy:
@@ -465,10 +461,13 @@ jobs:
                       cmd,
                       capture_output=True,
                       text=True,
-                      timeout=35
+                      timeout=75
                   )
 
                   return r.returncode == 0
+
+              except subprocess.TimeoutExpired:
+                  return False
 
               except Exception:
                   return False
@@ -477,10 +476,10 @@ jobs:
           def gst_test(url):
               try:
                   r = subprocess.run(
-                      ["gst-discoverer-1.0", "-t", "12", url],
+                      ["gst-discoverer-1.0", "-t", "30", url],
                       capture_output=True,
                       text=True,
-                      timeout=20
+                      timeout=45
                   )
 
                   output = (
@@ -498,6 +497,7 @@ jobs:
               except Exception:
                   return False
 
+          # Kanal kontrolü
           def check_channel(channel):
               name, url = channel
 
@@ -609,10 +609,10 @@ jobs:
 
           summary.extend([
               "",
-              "> HLS testi ana playlist, alt playlist, ilk üç segment "
-              "ve varsa şifreleme anahtarlarını kontrol eder.",
+              "> HLS ana playlist, alt playlist, ilk üç segment "
+              "ve anahtar erişimi kontrol edilir.",
               "",
-              "> Proxy testi başarılı olması yayın oynatma garantisi değildir."
+              "> Proxy bağlantısı başarılı olması yayın oynatma garantisi değildir."
           ])
 
           with open(
