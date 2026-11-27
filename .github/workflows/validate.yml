@@ -1,5 +1,5 @@
 
-name: MHR-1453 TV - HLS Proxy Monitor
+name: MHR-1453 TV - Fast HLS Monitor
 
 on:
   schedule:
@@ -20,44 +20,34 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+
+    env:
+      MHR_PROXY: ${{ secrets.MHR_PROXY_URL }}
 
     steps:
-      - name: Depoyu indir
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: FFmpeg ve GStreamer kur
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg \
-            python3-httpx \
-            gstreamer1.0-tools \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad \
-            gstreamer1.0-plugins-ugly \
-            gstreamer1.0-libav
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install --upgrade httpx
 
-      - name: HLS ve proxy kontrolü
+      - name: Run channel checks
         run: |
           python3 - <<'PY'
-          from pathlib import Path
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from urllib.parse import urljoin
-          import subprocess
-          import httpx
-          import json
           import os
           import re
+          import json
+          import httpx
+          import subprocess
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from concurrent.futures import ThreadPoolExecutor, as_completed
 
           FILE = Path("mhr-1453-tv.m3u")
-
-          PROXY_LIST = (
-              "https://cdn.jsdelivr.net/gh/"
-              "proxyscrape/free-proxy-list@main/"
-              "proxies/protocols/http/data.txt"
-          )
 
           USER_AGENT = (
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -70,14 +60,17 @@ jobs:
           }
 
           TIMEOUT = httpx.Timeout(
-              connect=20,
-              read=40,
-              write=20,
-              pool=20
+              connect=8,
+              read=15,
+              write=8,
+              pool=8
           )
 
+          MAX_WORKERS = 8
+          PROXY = os.environ.get("MHR_PROXY", "").strip() or None
+
           if not FILE.exists():
-              raise SystemExit("M3U bulunamadı!")
+              raise SystemExit("mhr-1453-tv.m3u bulunamadı!")
 
           lines = [
               x.strip()
@@ -88,7 +81,7 @@ jobs:
           ]
 
           if not lines or lines[0] != "#EXTM3U":
-              raise SystemExit("Geçersiz M3U!")
+              raise SystemExit("Geçersiz M3U dosyası!")
 
           channels = []
           pending = None
@@ -97,292 +90,114 @@ jobs:
               if line.startswith("#EXTINF:"):
                   pending = line.rsplit(",", 1)[-1].strip()
 
-              elif not line.startswith("#"):
-                  if pending:
-                      channels.append((pending, line))
-                      pending = None
+              elif not line.startswith("#") and pending:
+                  channels.append((pending, line))
+                  pending = None
 
           if not channels:
               raise SystemExit("Kanal bulunamadı!")
 
-          # Proxy listesini indir
-          print("Proxy listesi indiriliyor...")
+          print(f"Toplam kanal: {len(channels)}")
+          print("Kontrol başlıyor...")
 
-          proxy_candidates = []
-
-          try:
-              r = httpx.get(
-                  PROXY_LIST,
-                  timeout=40,
-                  follow_redirects=True
-              )
-              r.raise_for_status()
-
-              for line in r.text.splitlines():
-                  line = line.strip()
-
-                  if not line or ":" not in line:
-                      continue
-
-                  if line.startswith(("http://", "https://")):
-                      proxy = line
-                  else:
-                      proxy = "http://" + line
-
-                  if proxy not in proxy_candidates:
-                      proxy_candidates.append(proxy)
-
-          except Exception as e:
-              print("Proxy listesi alınamadı:", str(e)[:100])
-
-          print("Proxy adayı:", len(proxy_candidates))
-
-          # Proxy testi
-          def test_proxy(proxy):
-              try:
-                  with httpx.Client(
-                      proxy=proxy,
-                      headers=HEADERS,
-                      timeout=20,
-                      follow_redirects=True
-                  ) as client:
-                      r = client.get("https://api.ipify.org")
-
-                      if r.status_code == 200 and r.text.strip():
-                          return proxy
-
-              except Exception:
-                  pass
-
-              return None
-
-          working_proxies = []
-
-          with ThreadPoolExecutor(max_workers=12) as pool:
-              futures = [
-                  pool.submit(test_proxy, p)
-                  for p in proxy_candidates[:500]
-              ]
-
-              for future in as_completed(futures):
-                  result = future.result()
-
-                  if result:
-                      working_proxies.append(result)
-                      print("Çalışan proxy bulundu.")
-
-                      if len(working_proxies) >= 5:
-                          break
-
-          print("Çalışan proxy:", len(working_proxies))
-
-          def request_client(proxy=None):
+          def make_client(proxy=None):
               return httpx.Client(
-                  proxy=proxy,
                   headers=HEADERS,
+                  timeout=TIMEOUT,
                   follow_redirects=True,
-                  timeout=TIMEOUT
+                  proxy=proxy
               )
 
-          def fetch(client, url, limit=65536):
+          def fetch(client, url, limit=32768):
               with client.stream("GET", url) as response:
                   status = response.status_code
 
-                  if status in (401, 403):
-                      return status, b""
-
-                  if status not in (200, 206):
-                      return status, b""
-
                   data = bytearray()
 
-                  for chunk in response.iter_bytes(8192):
-                      data.extend(chunk)
-
-                      if len(data) >= limit:
-                          break
+                  if status in (200, 206):
+                      for chunk in response.iter_bytes(8192):
+                          data.extend(chunk)
+                          if len(data) >= limit:
+                              break
 
                   return status, bytes(data[:limit])
 
-          # HLS kontrolü
           def hls_check(client, url, depth=0):
-              try:
-                  if depth > 2:
-                      return "Şüpheli", "HLS alt playlist derinliği aşıldı"
+              if depth > 2:
+                  return False, "Alt playlist derinliği aşıldı"
 
-                  status, content = fetch(client, url)
+              try:
+                  status, data = fetch(client, url)
 
                   if status in (401, 403):
-                      return "Yetkilendirme", f"Playlist HTTP {status}"
+                      return False, f"HTTP {status}: erişim reddedildi"
 
                   if status not in (200, 206):
-                      return "Şüpheli", f"Playlist HTTP {status}"
+                      return False, f"Playlist HTTP {status}"
 
-                  text = content.decode(
+                  content = data.decode(
                       "utf-8-sig",
                       errors="replace"
                   )
 
                   rows = [
                       x.strip()
-                      for x in text.splitlines()
+                      for x in content.splitlines()
                       if x.strip()
                   ]
 
                   if not rows or rows[0] != "#EXTM3U":
-                      return "Şüpheli", "Geçersiz HLS başlığı"
+                      return False, "Geçersiz HLS playlist"
 
-                  # Master playlist
+                  # Master playlist içindeki ilk video playlisti
                   for index, row in enumerate(rows):
                       if row.startswith("#EXT-X-STREAM-INF"):
                           for next_row in rows[index + 1:]:
                               if not next_row.startswith("#"):
-                                  child_url = urljoin(url, next_row)
                                   return hls_check(
                                       client,
-                                      child_url,
+                                      urljoin(url, next_row),
                                       depth + 1
                                   )
 
-                  # Ses playlistleri
-                  for row in rows:
-                      if row.startswith("#EXT-X-MEDIA:"):
-                          match = re.search(
-                              r'URI="([^"]+)"',
-                              row
-                          )
-
-                          if match:
-                              media_url = urljoin(
-                                  url,
-                                  match.group(1)
-                              )
-
-                              media_status, _ = fetch(
-                                  client,
-                                  media_url
-                              )
-
-                              if media_status in (401, 403):
-                                  return (
-                                      "Yetkilendirme",
-                                      f"Ses playlist HTTP {media_status}"
-                                  )
-
-                  # HLS şifreleme anahtarı erişim kontrolü
-                  key_count = 0
-
-                  for row in rows:
-                      if row.startswith("#EXT-X-KEY:"):
-                          match = re.search(
-                              r'URI="([^"]+)"',
-                              row
-                          )
-
-                          if match:
-                              key_url = urljoin(url, match.group(1))
-                              key_status, _ = fetch(
-                                  client,
-                                  key_url,
-                                  4096
-                              )
-
-                              if key_status in (401, 403):
-                                  return (
-                                      "Yetkilendirme",
-                                      f"HLS anahtarı HTTP {key_status}"
-                                  )
-
-                              if key_status not in (200, 206):
-                                  return (
-                                      "Şüpheli",
-                                      f"HLS anahtarı HTTP {key_status}"
-                                  )
-
-                              key_count += 1
-
-                  # İlk üç segment
+                  # İlk segmenti kontrol et
                   segments = [
                       row for row in rows
                       if not row.startswith("#")
                   ]
 
                   if not segments:
-                      return "Şüpheli", "Segment bulunamadı"
+                      return False, "Segment bulunamadı"
 
-                  checked = 0
-
-                  for segment in segments[:3]:
-                      segment_url = urljoin(url, segment)
-
-                      seg_status, seg_data = fetch(
-                          client,
-                          segment_url,
-                          16384
-                      )
-
-                      if seg_status in (401, 403):
-                          return (
-                              "Yetkilendirme",
-                              f"Segment HTTP {seg_status}"
-                          )
-
-                      if seg_status not in (200, 206):
-                          return (
-                              "Şüpheli",
-                              f"Segment HTTP {seg_status}"
-                          )
-
-                      if not seg_data:
-                          return "Şüpheli", "Boş segment"
-
-                      checked += 1
-
-                  return (
-                      "OK",
-                      f"{checked} segment, {key_count} anahtar kontrol edildi"
+                  segment_url = urljoin(url, segments[0])
+                  seg_status, seg_data = fetch(
+                      client,
+                      segment_url,
+                      16384
                   )
 
-              except Exception as e:
-                  return "Şüpheli", str(e)[:120]
+                  if seg_status in (401, 403):
+                      return False, f"Segment HTTP {seg_status}"
 
-          # HTTP ve HLS
-          def http_test(url, proxy=None):
-              try:
-                  with request_client(proxy) as client:
-                      status, content = fetch(client, url)
+                  if seg_status not in (200, 206):
+                      return False, f"Segment HTTP {seg_status}"
 
-                      if status in (401, 403):
-                          return "Yetkilendirme", f"HTTP {status}"
+                  if not seg_data:
+                      return False, "Boş segment"
 
-                      if status in (404, 410):
-                          return "FAIL", f"HTTP {status}"
-
-                      if status not in (200, 206):
-                          return "Şüpheli", f"HTTP {status}"
-
-                      is_hls = (
-                          ".m3u8" in url.lower()
-                          or content.lstrip().startswith(b"#EXTM3U")
-                      )
-
-                      if is_hls:
-                          return hls_check(client, url)
-
-                      return "OK", "HTTP erişilebilir"
+                  return True, "HLS playlist ve segment erişilebilir"
 
               except Exception as e:
-                  return "Şüpheli", str(e)[:100]
+                  return False, f"HLS hatası: {str(e)[:100]}"
 
-          # FFprobe
           def probe_test(url, proxy=None):
               cmd = [
                   "ffprobe",
                   "-v", "error",
-                  "-rw_timeout", "30000000",
+                  "-rw_timeout", "12000000",
                   "-user_agent", USER_AGENT,
-                  "-probesize", "10000000",
-                  "-analyzeduration", "10000000",
+                  "-probesize", "2000000",
+                  "-analyzeduration", "2000000",
                   "-show_entries",
                   "stream=codec_type,codec_name",
                   "-of", "json"
@@ -394,18 +209,18 @@ jobs:
               cmd += ["-i", url]
 
               try:
-                  r = subprocess.run(
+                  result = subprocess.run(
                       cmd,
                       capture_output=True,
                       text=True,
-                      timeout=60
+                      timeout=15
                   )
 
-                  if r.returncode != 0:
-                      return False, False, False, "FFprobe başarısız"
+                  if result.returncode != 0:
+                      return False, False, False
 
                   streams = json.loads(
-                      r.stdout
+                      result.stdout
                   ).get("streams", [])
 
                   video = any(
@@ -418,30 +233,19 @@ jobs:
                       for s in streams
                   )
 
-                  return (
-                      bool(video or audio),
-                      video,
-                      audio,
-                      "FFprobe başarılı"
-                  )
-
-              except subprocess.TimeoutExpired:
-                  return False, False, False, "FFprobe zaman aşımı"
+                  return bool(video or audio), video, audio
 
               except Exception:
-                  return False, False, False, "FFprobe hatası"
+                  return False, False, False
 
-          # FFmpeg
           def ffmpeg_test(url, proxy=None):
               cmd = [
                   "ffmpeg",
                   "-nostdin",
                   "-hide_banner",
                   "-loglevel", "error",
-                  "-rw_timeout", "30000000",
-                  "-user_agent", USER_AGENT,
-                  "-probesize", "10000000",
-                  "-analyzeduration", "10000000"
+                  "-rw_timeout", "12000000",
+                  "-user_agent", USER_AGENT
               ]
 
               if proxy:
@@ -449,7 +253,7 @@ jobs:
 
               cmd += [
                   "-i", url,
-                  "-t", "8",
+                  "-t", "3",
                   "-map", "0:v:0?",
                   "-map", "0:a:0?",
                   "-f", "null",
@@ -457,140 +261,177 @@ jobs:
               ]
 
               try:
-                  r = subprocess.run(
+                  result = subprocess.run(
                       cmd,
                       capture_output=True,
                       text=True,
-                      timeout=75
+                      timeout=18
                   )
 
-                  return r.returncode == 0
-
-              except subprocess.TimeoutExpired:
-                  return False
+                  return result.returncode == 0
 
               except Exception:
                   return False
 
-          # GStreamer
-          def gst_test(url):
+          def check_route(name, url, proxy=None):
+              route = "Doğrudan" if not proxy else "Tanımlı proxy"
+
               try:
-                  r = subprocess.run(
-                      ["gst-discoverer-1.0", "-t", "30", url],
-                      capture_output=True,
-                      text=True,
-                      timeout=45
-                  )
+                  with make_client(proxy) as client:
+                      status, data = fetch(client, url)
 
-                  output = (
-                      r.stdout + r.stderr
-                  ).lower()
+                      if status in (401, 403):
+                          return {
+                              "ok": False,
+                              "state": "YETKİLENDİRME",
+                              "detail": f"HTTP {status}",
+                              "route": route
+                          }
 
-                  return (
-                      r.returncode == 0
-                      and (
-                          "video" in output
-                          or "audio" in output
+                      if status in (404, 410):
+                          return {
+                              "ok": False,
+                              "state": "KANAL HATASI",
+                              "detail": f"HTTP {status}",
+                              "route": route
+                          }
+
+                      if status not in (200, 206):
+                          return {
+                              "ok": False,
+                              "state": "BAĞLANTI HATASI",
+                              "detail": f"HTTP {status}",
+                              "route": route
+                          }
+
+                      is_hls = (
+                          ".m3u8" in url.lower()
+                          or data.lstrip().startswith(b"#EXTM3U")
                       )
-                  )
 
-              except Exception:
-                  return False
+                      if is_hls:
+                          hls_ok, detail = hls_check(client, url)
 
-          # Kanal kontrolü
+                          if not hls_ok:
+                              return {
+                                  "ok": False,
+                                  "state": "HLS HATASI",
+                                  "detail": detail,
+                                  "route": route
+                              }
+
+                      return {
+                          "ok": True,
+                          "state": "ERİŞİLEBİLİR",
+                          "detail": (
+                              detail if is_hls
+                              else "HTTP bağlantısı başarılı"
+                          ),
+                          "route": route
+                      }
+
+              except Exception as e:
+                  return {
+                      "ok": False,
+                      "state": "BAĞLANTI HATASI",
+                      "detail": str(e)[:100],
+                      "route": route
+                  }
+
           def check_channel(channel):
               name, url = channel
 
-              connection_options = [None] + working_proxies
-              last_detail = "Bağlantı kurulamadı"
+              # Önce doğrudan bağlantı
+              result = check_route(name, url)
 
-              for proxy in connection_options:
-                  state, detail = http_test(url, proxy)
+              # Yalnızca bağlantı hatasında tanımlı proxy'yi dene.
+              # 401/403 durumunda proxy ile erişim aşılmaya çalışılmaz.
+              if (
+                  not result["ok"]
+                  and result["state"] == "BAĞLANTI HATASI"
+                  and PROXY
+              ):
+                  result = check_route(name, url, PROXY)
 
-                  if state == "FAIL":
-                      return name, "FAIL", detail, "HTTP"
-
-                  if state == "Yetkilendirme":
-                      last_detail = detail
-                      continue
-
-                  if state != "OK":
-                      last_detail = detail
-                      continue
-
-                  probe_ok, video, audio, probe_detail = (
-                      probe_test(url, proxy)
-                  )
-
-                  ff_ok = ffmpeg_test(url, proxy)
-                  gst_ok = gst_test(url)
-
-                  if ff_ok and video and audio:
-                      return (
-                          name,
-                          "OK",
-                          "HLS + ses + görüntü doğrulandı",
-                          proxy or "Doğrudan"
-                      )
-
-                  if probe_ok or gst_ok:
-                      return (
-                          name,
-                          "KISMİ",
-                          "Akış bulundu fakat tam çözümleme yok",
-                          proxy or "Doğrudan"
-                      )
-
+              if not result["ok"]:
                   return (
                       name,
-                      "ERİŞİLEBİLİR",
-                      detail + " | Medya doğrulanamadı",
-                      proxy or "Doğrudan"
+                      result["state"],
+                      result["detail"],
+                      result["route"]
                   )
 
-              return (
-                  name,
-                  "DOĞRULANAMADI",
-                  last_detail,
-                  "Doğrudan/proxy testi başarısız"
+              probe_ok, video, audio = probe_test(
+                  url,
+                  PROXY if result["route"] == "Tanımlı proxy" else None
               )
 
-          print("\nKanal kontrolü başlıyor...\n")
+              ff_ok = ffmpeg_test(
+                  url,
+                  PROXY if result["route"] == "Tanımlı proxy" else None
+              )
+
+              if probe_ok and video and audio and ff_ok:
+                  state = "BAŞARILI"
+                  detail = "HLS + ses + görüntü doğrulandı"
+
+              elif probe_ok or ff_ok:
+                  state = "KISMİ"
+                  detail = (
+                      f"Medya bulundu | Video: {video} | Ses: {audio}"
+                  )
+
+              else:
+                  state = "ERİŞİLEBİLİR"
+                  detail = (
+                      "HTTP/HLS erişilebilir, medya çözümlemesi "
+                      "doğrulanamadı"
+                  )
+
+              return name, state, detail, result["route"]
 
           results = []
 
-          with ThreadPoolExecutor(max_workers=4) as pool:
+          with ThreadPoolExecutor(
+              max_workers=MAX_WORKERS
+          ) as executor:
+
               futures = [
-                  pool.submit(check_channel, c)
-                  for c in channels
+                  executor.submit(check_channel, channel)
+                  for channel in channels
               ]
 
               for future in as_completed(futures):
-                  result = future.result()
-                  results.append(result)
+                  try:
+                      result = future.result()
+                      results.append(result)
 
-                  print(
-                      f"{result[1]} - {result[0]}: "
-                      f"{result[2]}"
-                  )
+                      print(
+                          f"{result[1]} | {result[0]} | "
+                          f"{result[2]}"
+                      )
+
+                  except Exception as e:
+                      print("Kontrol hatası:", str(e)[:100])
 
           results.sort(key=lambda x: x[0].casefold())
 
           counts = {}
 
-          for item in results:
-              counts[item[1]] = counts.get(item[1], 0) + 1
+          for name, state, detail, route in results:
+              counts[state] = counts.get(state, 0) + 1
 
           summary = [
-              "# MHR-1453 TV - HLS Proxy Kontrolü",
+              "# MHR-1453 TV - HLS Kontrol Raporu",
               "",
-              f"- Toplam kanal: {len(results)}",
-              f"- Proxy adayı: {len(proxy_candidates)}",
-              f"- Çalışan proxy: {len(working_proxies)}",
+              f"- Toplam kanal: {len(channels)}",
+              f"- Kontrol edilen: {len(results)}",
+              f"- Paralel işçi: {MAX_WORKERS}",
+              f"- Tanımlı proxy: {'Var' if PROXY else 'Yok'}",
               ""
           ]
 
-          for state, count in counts.items():
+          for state, count in sorted(counts.items()):
               summary.append(f"- {state}: {count}")
 
           summary.extend([
@@ -599,20 +440,19 @@ jobs:
               "|---|---|---|---|"
           ])
 
-          for name, state, detail, proxy in results:
+          for name, state, detail, route in results:
+              name = name.replace("|", "/")
+              detail = detail.replace("|", "/")
               summary.append(
-                  f"| {name.replace('|', '/')} "
-                  f"| {state} "
-                  f"| {detail.replace('|', '/')} "
-                  f"| {str(proxy).replace('|', '/')} |"
+                  f"| {name} | {state} | {detail} | {route} |"
               )
 
           summary.extend([
               "",
-              "> HLS ana playlist, alt playlist, ilk üç segment "
-              "ve anahtar erişimi kontrol edilir.",
+              "> HTTP erişimi tek başına yayının oynatılabildiğini "
+              "kanıtlamaz.",
               "",
-              "> Proxy bağlantısı başarılı olması yayın oynatma garantisi değildir."
+              "> 401 ve 403 erişim/yetkilendirme yanıtlarıdır."
           ])
 
           with open(
