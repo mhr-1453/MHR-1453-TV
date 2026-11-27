@@ -1,189 +1,168 @@
 
-name: MHR-1453 TV - HLS Check
+name: M3U Otomatik Kontrol
 
 on:
+  schedule:
+    - cron: "*/10 * * * *"
   workflow_dispatch:
   push:
     paths:
       - "mhr-1453-tv.m3u"
       - ".github/workflows/validate.yml"
-  schedule:
-    - cron: "17 5,17 * * *"
 
 permissions:
   contents: read
 
 jobs:
-  check:
+  validate:
+    name: M3U ve Yayın Kontrolü
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
-      - name: Checkout
+      - name: Depoyu indir
         uses: actions/checkout@v4
 
-      - name: Install Python dependency
-        run: pip install httpx
-
-      - name: Check M3U and HLS
+      - name: Yayınları kontrol et
         run: |
-          python - <<'PY'
-          import httpx
-          import re
-          import time
-          from urllib.parse import urljoin
+          python3 - <<'PY'
+          from pathlib import Path
           from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          import os
 
-          FILE = "mhr-1453-tv.m3u"
-          HEADERS = {
-              "User-Agent": "Mozilla/5.0",
-              "Accept": "*/*"
-          }
+          file = Path("mhr-1453-tv.m3u")
 
-          def fetch(url):
-              for attempt in range(3):
-                  try:
-                      response = httpx.get(
-                          url,
-                          headers=HEADERS,
-                          timeout=15,
-                          follow_redirects=True
-                      )
+          if not file.exists():
+              raise SystemExit("M3U dosyası bulunamadı!")
 
-                      if response.status_code in (401, 403):
-                          return None, f"HTTP {response.status_code}"
+          lines = [
+              line.strip()
+              for line in file.read_text(encoding="utf-8-sig").splitlines()
+              if line.strip()
+          ]
 
-                      response.raise_for_status()
-                      return response.text, "OK"
+          if not lines or lines[0] != "#EXTM3U":
+              raise SystemExit("Geçersiz M3U başlığı!")
 
-                  except Exception as error:
-                      last_error = str(error)
+          channels = []
+          pending = None
 
-                      if attempt < 2:
-                          time.sleep(1)
+          for line in lines[1:]:
+              if line.startswith("#EXTINF:"):
+                  if pending is not None:
+                      raise SystemExit("Eksik yayın adresi!")
+                  pending = line.rsplit(",", 1)[-1].strip() or "İsimsiz kanal"
 
-              return None, last_error
+              elif not line.startswith("#"):
+                  if pending is None:
+                      raise SystemExit("Bağımsız yayın adresi bulundu!")
+
+                  if not line.startswith(("http://", "https://")):
+                      raise SystemExit(f"Geçersiz adres: {pending}")
+
+                  channels.append((pending, line))
+                  pending = None
+
+          if pending is not None:
+              raise SystemExit("Son kanalın adresi eksik!")
+
+          if not channels:
+              raise SystemExit("Hiç kanal bulunamadı!")
+
+          print(f"M3U geçerli: {len(channels)} kanal bulundu.")
 
           def check_channel(channel):
               name, url = channel
 
-              content, error = fetch(url)
+              request = Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0",
+                      "Range": "bytes=0-4095"
+                  }
+              )
 
-              if content is None:
-                  return name, "BAŞARISIZ", error
+              try:
+                  with urlopen(request, timeout=15) as response:
+                      status = response.status
+                      sample = response.read(4096)
 
-              if "#EXTM3U" not in content:
-                  return name, "ERİŞİLEBİLİR", "HLS playlist değil"
+                  if 200 <= status < 300:
+                      if b"#EXTM3U" in sample:
+                          return name, "OK", f"HTTP {status} - HLS geçerli"
 
-              lines = [
-                  line.strip()
-                  for line in content.splitlines()
-                  if line.strip()
-              ]
+                      return name, "WARN", f"HTTP {status} - HLS doğrulanamadı"
 
-              # Master playlist ise ilk varyantı kullan.
-              for index, line in enumerate(lines):
-                  if line.startswith("#EXT-X-STREAM-INF"):
-                      for next_line in lines[index + 1:]:
-                          if not next_line.startswith("#"):
-                              url = urljoin(url, next_line)
-                              content, error = fetch(url)
+                  return name, "FAIL", f"HTTP {status}"
 
-                              if content is None:
-                                  return name, "BAŞARISIZ", error
+              except HTTPError as error:
+                  if error.code in (401, 403, 429):
+                      return name, "WARN", f"HTTP {error.code} - Erişim kısıtlı"
 
-                              lines = [
-                                  item.strip()
-                                  for item in content.splitlines()
-                                  if item.strip()
-                              ]
-                              break
-                      break
+                  return name, "FAIL", f"HTTP {error.code}"
 
-              segments = [
-                  line for line in lines
-                  if not line.startswith("#")
-              ][:3]
-
-              if not segments:
-                  return name, "BAŞARISIZ", "Segment bulunamadı"
-
-              success = 0
-
-              for segment in segments:
-                  segment_url = urljoin(url, segment)
-                  _, error = fetch(segment_url)
-
-                  if error == "OK":
-                      success += 1
-
-              if success == len(segments):
-                  return name, "BAŞARILI", f"{success}/{len(segments)} segment"
-
-              if success > 0:
-                  return name, "KISMİ", f"{success}/{len(segments)} segment"
-
-              return name, "BAŞARISIZ", "Segmentlere erişilemiyor"
-
-          # M3U oku
-          with open(FILE, encoding="utf-8-sig") as file:
-              lines = [
-                  line.strip()
-                  for line in file
-                  if line.strip()
-              ]
-
-          if not lines or lines[0] != "#EXTM3U":
-              raise SystemExit("Geçersiz M3U dosyası")
-
-          channels = []
-          name = None
-
-          for line in lines[1:]:
-              if line.startswith("#EXTINF"):
-                  name = line.rsplit(",", 1)[-1].strip()
-
-              elif not line.startswith("#") and name:
-                  channels.append((name, line))
-                  name = None
-
-          print(f"Toplam kanal: {len(channels)}")
+              except (URLError, TimeoutError, OSError) as error:
+                  return name, "FAIL", f"Bağlantı hatası: {error}"
 
           results = []
 
-          with ThreadPoolExecutor(max_workers=8) as pool:
+          with ThreadPoolExecutor(max_workers=5) as executor:
               futures = [
-                  pool.submit(check_channel, channel)
+                  executor.submit(check_channel, channel)
                   for channel in channels
               ]
 
               for future in as_completed(futures):
-                  result = future.result()
-                  results.append(result)
-                  print(" | ".join(result))
+                  results.append(future.result())
 
-          results.sort(key=lambda item: item[0].lower())
+          results.sort(key=lambda x: x[0].casefold())
+
+          ok = [x for x in results if x[1] == "OK"]
+          warn = [x for x in results if x[1] == "WARN"]
+          failed = [x for x in results if x[1] == "FAIL"]
+
+          print("\n===== MHR-1453 TV SONUÇLARI =====")
 
           summary = [
-              "# MHR-1453 TV HLS Raporu",
+              "## MHR-1453 TV Yayın Kontrolü",
               "",
-              f"Toplam kanal: {len(channels)}",
+              f"- Toplam kanal: **{len(channels)}**",
+              f"- Çalışır görünen: **{len(ok)}**",
+              f"- Uyarı: **{len(warn)}**",
+              f"- Erişilemeyen: **{len(failed)}**",
               "",
-              "| Kanal | Durum | Detay |",
+              "| Kanal | Durum | Açıklama |",
               "|---|---|---|"
           ]
 
-          for name, status, detail in results:
+          for name, state, detail in results:
+              label = {
+                  "OK": "✅ OK",
+                  "WARN": "⚠️ Uyarı",
+                  "FAIL": "❌ Hata"
+              }[state]
+
+              print(f"{label} - {name}: {detail}")
+
               summary.append(
-                  f"| {name} | {status} | {detail} |"
+                  f"| {name.replace('|', '/')} | {label} | {detail} |"
               )
 
-          with open(
-              __import__("os").environ["GITHUB_STEP_SUMMARY"],
-              "a",
-              encoding="utf-8"
-          ) as report:
-              report.write("\n".join(summary) + "\n")
+          summary.append("")
+          summary.append(
+              "> Bu test bağlantıyı ve HLS yanıtını kontrol eder. "
+              "Görüntü ve sesin oynatılacağını kesin olarak garanti etmez. "
+              "401, 403 ve 429 yanıtları uyarı olarak değerlendirilir."
+          )
 
-          print("Kontrol tamamlandı.")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+
+          if failed:
+              raise SystemExit(
+                  f"{len(failed)} kanal erişilemedi!"
+              )
+
+          print("\nKontrol tamamlandı!")
           PY
