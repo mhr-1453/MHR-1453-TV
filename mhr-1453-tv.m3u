@@ -3,6 +3,9 @@
 #EXTINF:-1 tvg-id="trt1" tvg-logo="https://files.catbox.moe/epz75g.png" group-title="Ulusal",TRT 1
 https://tv-trt1.medya.trt.com.tr/master.m3u8
 
+#EXTINF:-1 tvg-id="trt2" tvg-logo="https://files.catbox.moe/lwr3ec.png" group-title="Ulusal",TRT 2
+https://tv-trt2.medya.trt.com.tr/master.m3u8
+
 #EXTINF:-1 tvg-id="kanal7" tvg-logo="https://files.catbox.moe/sk8a7w.png" group-title="Ulusal",Kanal 7
 https://kanal7-live.daioncdn.net/kanal7/kanal7.m3u8
 
@@ -14,6 +17,9 @@ https://dogus.daioncdn.net/startv/startv_720p.m3u8?&sid=8vdu5dx79x5x&app=a20ac41
 
 #EXTINF:-1 tvg-id="atv" tvg-logo="https://files.catbox.moe/7wg3xw.png" group-title="Ulusal",ATV
 https://taraftarium24.best/cdn/atv/index.m3u8
+
+#EXTINF:-1 tvg-id="a2tv" tvg-logo="https://files.catbox.moe/4wtjc9.png" group-title="Ulusal",A2TV
+https://rnttwmjcin.turknet.ercdn.net/lcpmvefbyo/a2tv/a2tv.m3u8
 
 #EXTINF:-1 tvg-id="kanald" tvg-logo="https://files.catbox.moe/ea5vxn.png" group-title="Ulusal",Kanal D
 https://live.duhnet.tv/S2/HLS_LIVE/kanalddainp/playlist.m3u8
@@ -65,6 +71,9 @@ https://tv-trtspor1.medya.trt.com.tr/master.m3u8
 
 #EXTINF:-1 tvg-id="aspor" tvg-logo="https://files.catbox.moe/zr1jpo.png" group-title="Spor",A Spor
 https://rnttwmjcin.turknet.ercdn.net/lcpmvefbyo/aspor/aspor.m3u8
+
+#EXTINF:-1 tvg-id="tele1" tvg-logo="https://files.catbox.moe/9ho5nj.png" group-title="Haber",Tele1
+https://tele1-live.ercdn.net/tele1/tele1.m3u8
 
 #EXTINF:-1 tvg-id="ntv" tvg-logo="https://files.catbox.moe/utjqjx.png" group-title="Haber",NTV
 https://dogus.daioncdn.net/ntv/ntv_720p.m3u8?sig=12e805494df807d580a4aae395a17c64&token=NTNpSGo5RFc3anhWYjVWZXN4QndvZXkzdm9CZXJLek5meEJOajNMbldvZz0=&sid=7umf8gmx7sxg&app=7c4bb802-0c41-409e-8cd2-799984995694&ce=3
